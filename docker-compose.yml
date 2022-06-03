@@ -7,7 +7,7 @@ services:
     # changes to these tokens, please update this parsing logic.
     image: &boulder_image letsencrypt/boulder-tools:${BOULDER_TOOLS_TAG:-go1.18.4_2022-07-20}
     environment:
-      FAKE_DNS: 10.77.77.77
+      FAKE_DNS: 10.77.77.88
       BOULDER_CONFIG_DIR: test/config
       GOFLAGS: -mod=vendor
       # Go 1.18 turns off SHA-1 validation on CSRs (and certs, but that doesn't
@@ -150,6 +150,30 @@ services:
       - .:/boulder
     working_dir: *boulder_working_dir
     entrypoint: test/entrypoint-netaccess.sh
+
+  observer:
+    image: *boulder_image
+    environment:
+        GO111MODULE: "on"
+        GOFLAGS: -mod=vendor
+        BOULDER_CONFIG_DIR: test/config-next
+    networks:
+      bluenet:
+        ipv4_address: 10.77.77.88
+    volumes:
+      - .:/boulder
+    working_dir: *boulder_working_dir
+    entrypoint: test/entrypoint-observer.sh
+
+  prometheus:
+    image: prom/prometheus
+    networks:
+      bluenet:
+        ipv4_address: 10.77.77.99
+    ports:
+      - 9090:9090
+    volumes:
+      - ./test/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
 
 networks:
   bluenet:

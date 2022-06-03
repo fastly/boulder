@@ -172,6 +172,39 @@ monitors:
       useragent: letsencrypt/boulder-observer-http-client
 ```
 
+#### ACME
+
+##### Schema
+
+`url`: ACME Directory URL (e.g. `http://boulder:4001/directory`).
+
+`domain`: Domain used for certificate issuance.
+
+`email`: Email address (RFC 2822) for ACME Account registration;
+optional.
+
+`keytype`: Public-key algorithm type for certificate request. If no
+keytype string is provided it will use the LEGO library default,
+currently `RSA2048`.
+
+<!-- `useragent`: String to set HTTP header User-Agent. If no useragent string
+is provided it will default to `letsencrypt/boulder-observer-acme-client`. -->
+
+##### Example
+
+```yaml
+monitors:
+  - 
+    period: 5s
+    kind: ACME
+    settings:
+      domain: le.wtf
+      email: foo@bar.com
+      keytype: P256
+      url: http://boulder:4001/directory
+      # useragent: letsencrypt/boulder-observer-acme-client
+```
+
 ## Metrics
 
 Observer provides the following metrics.

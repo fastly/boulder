@@ -2,8 +2,8 @@
 debugaddr: :8040
 buckets: [.001, .002, .005, .01, .02, .05, .1, .2, .5, 1, 2, 5, 10]
 syslog:
-  stdoutlevel: 6
-  sysloglevel: 6
+  stdoutlevel: 7
+  sysloglevel: 7
 monitors:
   -
     period: 5s
@@ -91,3 +91,12 @@ monitors:
       url: http://letsencrypt.org/foo
       rcodes: [200, 404]
       useragent: "letsencrypt/boulder-observer-http-client"
+  - 
+    period: 5s
+    kind: ACME
+    settings:
+      domain: le.wtf 
+      email: nobody@le.wtf
+      keytype: 2048
+      url: http://boulder:4001/directory
+      # useragent: letsencrypt/boulder-observer-acme-client
