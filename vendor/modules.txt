@@ -4,6 +4,9 @@ github.com/beeker1121/goque
 # github.com/beorn7/perks v1.0.1
 ## explicit; go 1.11
 github.com/beorn7/perks/quantile
+# github.com/cenkalti/backoff/v4 v4.1.1
+## explicit; go 1.13
+github.com/cenkalti/backoff/v4
 # github.com/cespare/xxhash/v2 v2.1.2
 ## explicit; go 1.11
 github.com/cespare/xxhash/v2
@@ -25,6 +28,24 @@ github.com/facebookgo/muster
 # github.com/felixge/httpsnoop v1.0.1
 ## explicit; go 1.13
 github.com/felixge/httpsnoop
+# github.com/go-acme/lego/v4 v4.7.0
+## explicit; go 1.17
+github.com/go-acme/lego/v4/acme
+github.com/go-acme/lego/v4/acme/api
+github.com/go-acme/lego/v4/acme/api/internal/nonces
+github.com/go-acme/lego/v4/acme/api/internal/secure
+github.com/go-acme/lego/v4/acme/api/internal/sender
+github.com/go-acme/lego/v4/certcrypto
+github.com/go-acme/lego/v4/certificate
+github.com/go-acme/lego/v4/challenge
+github.com/go-acme/lego/v4/challenge/dns01
+github.com/go-acme/lego/v4/challenge/http01
+github.com/go-acme/lego/v4/challenge/resolver
+github.com/go-acme/lego/v4/challenge/tlsalpn01
+github.com/go-acme/lego/v4/lego
+github.com/go-acme/lego/v4/log
+github.com/go-acme/lego/v4/platform/wait
+github.com/go-acme/lego/v4/registration
 # github.com/go-gorp/gorp/v3 v3.0.2
 ## explicit; go 1.13
 github.com/go-gorp/gorp/v3
@@ -200,8 +221,8 @@ go.opentelemetry.io/otel/propagation
 # go.opentelemetry.io/otel/trace v0.19.0
 ## explicit; go 1.14
 go.opentelemetry.io/otel/trace
-# golang.org/x/crypto v0.0.0-20210322153248-0c34fe9e7dc2
-## explicit; go 1.11
+# golang.org/x/crypto v0.0.0-20210616213533-5ff15b29337e
+## explicit; go 1.17
 golang.org/x/crypto/cryptobyte
 golang.org/x/crypto/cryptobyte/asn1
 golang.org/x/crypto/ed25519
@@ -211,7 +232,7 @@ golang.org/x/crypto/pbkdf2
 # golang.org/x/mod v0.4.2
 ## explicit; go 1.12
 golang.org/x/mod/semver
-# golang.org/x/net v0.0.0-20211029224645-99673261e6eb
+# golang.org/x/net v0.0.0-20211112202133-69e39bad7dc2
 ## explicit; go 1.17
 golang.org/x/net/bpf
 golang.org/x/net/context
@@ -226,14 +247,14 @@ golang.org/x/net/internal/timeseries
 golang.org/x/net/ipv4
 golang.org/x/net/ipv6
 golang.org/x/net/trace
-# golang.org/x/sys v0.0.0-20220114195835-da31bd327af9
+# golang.org/x/sys v0.0.0-20220209214540-3681064d5158
 ## explicit; go 1.17
 golang.org/x/sys/execabs
 golang.org/x/sys/internal/unsafeheader
 golang.org/x/sys/unix
 golang.org/x/sys/windows
-# golang.org/x/text v0.3.6
-## explicit; go 1.11
+# golang.org/x/text v0.3.7
+## explicit; go 1.17
 golang.org/x/text/secure/bidirule
 golang.org/x/text/transform
 golang.org/x/text/unicode/bidi
