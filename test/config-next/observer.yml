@@ -91,3 +91,10 @@ monitors:
       url: http://letsencrypt.org/foo
       rcodes: [200, 404]
       useragent: "letsencrypt/boulder-observer-http-client"
+  - 
+    period: 15s
+    kind: ACME
+    settings: 
+      caDirURL: http://boulder:4001/directory
+      domain: "ee.boulder.net"
+      email: ""

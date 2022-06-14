@@ -4,6 +4,7 @@ import (
 	blog "github.com/letsencrypt/boulder/log"
 	_ "github.com/letsencrypt/boulder/observer/probers/dns"
 	_ "github.com/letsencrypt/boulder/observer/probers/http"
+	_ "github.com/letsencrypt/boulder/observer/probers/ocsp"
 )
 
 // Observer is the steward of goroutines started for each `monitor`.
