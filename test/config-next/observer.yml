@@ -1,4 +1,4 @@
---- 
+---
 debugaddr: :8040
 buckets: [.001, .002, .005, .01, .02, .05, .1, .2, .5, 1, 2, 5, 10]
 syslog:
@@ -32,10 +32,10 @@ monitors:
       recurse: true
       query_name: google.com
       query_type: A
-  - 
+  -
     period: 2s
     kind: HTTP
-    settings: 
+    settings:
       url: https://letsencrypt.org
       rcodes: [200]
       useragent: "letsencrypt/boulder-observer-http-client"
@@ -84,10 +84,10 @@ monitors:
       recurse: true
       query_name: google.com
       query_type: A
-  - 
+  -
     period: 2s
     kind: HTTP
-    settings: 
+    settings:
       url: http://letsencrypt.org/foo
       rcodes: [200, 404]
       useragent: "letsencrypt/boulder-observer-http-client"
@@ -95,8 +95,11 @@ monitors:
     period: 5s
     kind: ACME
     settings:
-      domain: le.wtf 
+      domains:
+        - le.wtf
+        # - le1.wtf
+        # - le2.wtf
       email: nobody@le.wtf
-      keytype: 2048
+      keytype: P256
       url: http://boulder:4001/directory
       # useragent: letsencrypt/boulder-observer-acme-client

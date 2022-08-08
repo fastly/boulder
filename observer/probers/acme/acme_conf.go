@@ -10,10 +10,10 @@ import (
 
 // ACMEConf is exported to receive YAML configuration.
 type ACMEConf struct {
-	Domain  string `yaml:"domain"`
-	Email   string `yaml:"email"`
-	KeyType string `yaml:"keytype"`
-	URL     string `yaml:"url"`
+	Domains []string `yaml:"domains"`
+	Email   string   `yaml:"email"`
+	KeyType string   `yaml:"keytype"`
+	URL     string   `yaml:"url"`
 }
 
 // UnmarshalSettings takes YAML as bytes and unmarshals it to an
@@ -77,7 +77,7 @@ func (c ACMEConf) MakeProber() (probers.Prober, error) {
 	}
 
 	return ACMEProbe{
-		c.Domain, c.Email, c.KeyType, c.URL}, nil
+		c.Domains, c.Email, c.KeyType, c.URL}, nil
 }
 
 // init is called at runtime and registers `ACMEConf`, a `Prober`

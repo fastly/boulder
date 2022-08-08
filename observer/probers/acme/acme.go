@@ -6,6 +6,7 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"fmt"
+	"log"
 	"time"
 
 	"github.com/go-acme/lego/v4/certcrypto"
@@ -19,7 +20,7 @@ import (
 // ACMEProbe is the exported 'Prober' object for monitors configured to
 // perform ACME requests.
 type ACMEProbe struct {
-	domain  string
+	domains []string
 	email   string
 	keyType string
 	url     string
@@ -27,7 +28,7 @@ type ACMEProbe struct {
 
 // Name returns a string that uniquely identifies the monitor.
 func (p ACMEProbe) Name() string {
-	return fmt.Sprintf("%s-%s-%s", p.url, p.domain, p.keyType)
+	return fmt.Sprintf("%s-%s-%s", p.url, p.domains, p.keyType)
 }
 
 // Kind returns a name that uniquely identifies the `Kind` of `Prober`.
@@ -105,20 +106,15 @@ func (p ACMEProbe) Probe(timeout time.Duration) (bool, time.Duration) {
 	myUser.Registration = reg
 
 	request := certificate.ObtainRequest{
-		Domains: []string{p.domain},
+		Domains: p.domains,
 		Bundle:  true,
 	}
-	certificates, err := client.Certificate.Obtain(request)
+	_, err = client.Certificate.Obtain(request)
 	if err != nil {
+		// this printf is for debugging purposes
+		log.Printf("%s", err)
 		return false, time.Since(start)
 	}
 
-	// Each certificate comes back with the cert bytes, the bytes of the client's
-	// private key, and a certificate URL. SAVE THESE TO DISK.
-	fmt.Printf("%#v\n", certificates)
-
-	// ... all done.
-
 	return true, time.Since(start)
-
 }

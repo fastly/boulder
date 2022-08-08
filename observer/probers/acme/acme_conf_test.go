@@ -11,7 +11,7 @@ import (
 
 func TestACMEConf_MakeProber(t *testing.T) {
 	type fields struct {
-		Domain  string
+		Domains []string
 		Email   string
 		KeyType string
 		URL     string
@@ -22,17 +22,17 @@ func TestACMEConf_MakeProber(t *testing.T) {
 		wantErr bool
 	}{
 		// valid
-		{"valid domain valid email valid ec keytype valid url", fields{"example.net", "nobody@example.com", "P256", "https://api.example.com/directory"}, false},
-		{"valid domain valid email valid rsa keytype valid url", fields{"example.net", "nobody@example.com", "4096", "https://api.example.com/directory"}, false},
+		{"valid domain valid email valid ec keytype valid url", fields{[]string{"example.net"}, "nobody@example.com", "P256", "https://api.example.com/directory"}, false},
+		{"valid domain valid email valid rsa keytype valid url", fields{[]string{"example.net"}, "nobody@example.com", "4096", "https://api.example.com/directory"}, false},
 		// invalid
-		{"url missing scheme", fields{"example.net", "nobody@example.com", "P256", "api.example.com"}, true},
-		{"valid domain valid email valid keytype bad url", fields{"example.net", "nobody@example.org", "P256", "https://api.example"}, false},
-		{"valid domain valid email bad keytype valid url", fields{"example.net", "nobody@example.org", "1024", "https://api.example.com/directory"}, true},
+		{"url missing scheme", fields{[]string{"example.net"}, "nobody@example.com", "P256", "api.example.com"}, true},
+		{"valid domain valid email valid keytype bad url", fields{[]string{"example.net"}, "nobody@example.org", "P256", "https://api.example"}, false},
+		{"valid domain valid email bad keytype valid url", fields{[]string{"example.net"}, "nobody@example.org", "1024", "https://api.example.com/directory"}, true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			c := ACMEConf{
-				Domain:  tt.fields.Domain,
+				Domains: tt.fields.Domains,
 				Email:   tt.fields.Email,
 				KeyType: tt.fields.KeyType,
 				URL:     tt.fields.URL,
@@ -46,7 +46,7 @@ func TestACMEConf_MakeProber(t *testing.T) {
 
 func TestACMEConf_UnmarshalSettings(t *testing.T) {
 	type fields struct {
-		domain  interface{}
+		domains interface{}
 		email   interface{}
 		keyType interface{}
 		url     interface{}
@@ -57,13 +57,13 @@ func TestACMEConf_UnmarshalSettings(t *testing.T) {
 		want    probers.Configurer
 		wantErr bool
 	}{
-		{"valid", fields{"example.net", "nobody@example.org", "P256", "https://api.example.com/directory"},
-			ACMEConf{"example.net", "nobody@example.org", "P256", "https://api.example.com/directory"}, false},
+		{"valid", fields{[]string{"example.net"}, "nobody@example.org", "P256", "https://api.example.com/directory"},
+			ACMEConf{[]string{"example.net"}, "nobody@example.org", "P256", "https://api.example.com/directory"}, false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			settings := probers.Settings{
-				"domain":  tt.fields.domain,
+				"domains": tt.fields.domains,
 				"email":   tt.fields.email,
 				"keytype": tt.fields.keyType,
 				"url":     tt.fields.url,
@@ -84,7 +84,7 @@ func TestACMEConf_UnmarshalSettings(t *testing.T) {
 
 func TestACMEProberName(t *testing.T) {
 	proberYAML := `
-domain: example.net
+domains: [ example.net ]
 email: nobody@example.org
 keytype: P256
 url: https://api.example.com/directory
