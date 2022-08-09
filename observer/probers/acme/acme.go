@@ -1,5 +1,8 @@
 package probers
 
+// TODO: add random prefix to first domain name in domains list
+// TODO: add dns challenge and internal dns server with challenge solver
+
 import (
 	"crypto"
 	"crypto/ecdsa"
@@ -20,10 +23,11 @@ import (
 // ACMEProbe is the exported 'Prober' object for monitors configured to
 // perform ACME requests.
 type ACMEProbe struct {
-	domains []string
-	email   string
-	keyType string
-	url     string
+	domains      []string
+	email        string
+	keyType      string
+	prefixLength int
+	url          string
 }
 
 // Name returns a string that uniquely identifies the monitor.
@@ -60,7 +64,7 @@ func (p ACMEProbe) Probe(timeout time.Duration) (bool, time.Duration) {
 	// Create a user. New accounts need an email and private key to start.
 	privateKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
-		return false, time.Since(start)
+		return false, 0
 	}
 
 	myUser := MyUser{
@@ -76,24 +80,20 @@ func (p ACMEProbe) Probe(timeout time.Duration) (bool, time.Duration) {
 	// A client facilitates communication with the CA server.
 	client, err := lego.NewClient(config)
 	if err != nil {
-		return false, time.Since(start)
+		return false, 0
 	}
 
-	// We specify an HTTP port of 5002 and an TLS port of 5001 on all interfaces
-	// because we aren't running as root and can't bind a listener to port 80 and 443
-	// (used later when we attempt to pass challenges). Keep in mind that you still
-	// need to proxy challenge traffic to port 5002 and 5001.
 	err = client.Challenge.SetHTTP01Provider(
 		http01.NewProviderServer("", "5002"),
 	)
 	if err != nil {
-		return false, time.Since(start)
+		return false, 0
 	}
 	err = client.Challenge.SetTLSALPN01Provider(
 		tlsalpn01.NewProviderServer("", "5001"),
 	)
 	if err != nil {
-		return false, time.Since(start)
+		return false, 0
 	}
 
 	// New users will need to register
@@ -101,20 +101,38 @@ func (p ACMEProbe) Probe(timeout time.Duration) (bool, time.Duration) {
 		registration.RegisterOptions{TermsOfServiceAgreed: true},
 	)
 	if err != nil {
-		return false, time.Since(start)
+		return false, 0
 	}
 	myUser.Registration = reg
 
+	var myDomains = make([]string, len(p.domains))
+	copy(myDomains, p.domains)
+	if p.prefixLength > 0 {
+		// Add a random prefix to the first domain name in the list.
+		myDomains[0] = fmt.Sprintf("%s.%s", randString(p.prefixLength), p.domains[0])
+	}
+
 	request := certificate.ObtainRequest{
-		Domains: p.domains,
+		Domains: myDomains,
 		Bundle:  true,
 	}
 	_, err = client.Certificate.Obtain(request)
 	if err != nil {
 		// this printf is for debugging purposes
 		log.Printf("%s", err)
-		return false, time.Since(start)
+		return false, 0
 	}
 
 	return true, time.Since(start)
+}
+
+func randString(n int) string {
+	// Random string of length n
+	const alphanum = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+	var bytes = make([]byte, n)
+	rand.Read(bytes)
+	for i, b := range bytes {
+		bytes[i] = alphanum[b%byte(len(alphanum))]
+	}
+	return string(bytes)
 }

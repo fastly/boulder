@@ -76,8 +76,9 @@ func (c ACMEConf) MakeProber() (probers.Prober, error) {
 		return nil, err
 	}
 
+	prefixLength := 2
 	return ACMEProbe{
-		c.Domains, c.Email, c.KeyType, c.URL}, nil
+		c.Domains, c.Email, c.KeyType, prefixLength, c.URL}, nil
 }
 
 // init is called at runtime and registers `ACMEConf`, a `Prober`

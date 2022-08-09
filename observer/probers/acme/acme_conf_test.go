@@ -94,5 +94,5 @@ url: https://api.example.com/directory
 	test.AssertNotError(t, err, "Got error for valid prober config")
 	prober, err := configurer.MakeProber()
 	test.AssertNotError(t, err, "Got error for valid prober config")
-	test.AssertEquals(t, prober.Name(), "https://api.example.com/directory-example.net-P256")
+	test.AssertEquals(t, prober.Name(), "https://api.example.com/directory-[example.net]-P256")
 }
