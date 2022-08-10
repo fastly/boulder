@@ -1,6 +1,6 @@
 package probers
 
-// TODO: add random prefix to first domain name in domains list
+// DONE: add random prefix to first domain name in domains list
 // TODO: add dns challenge and internal dns server with challenge solver
 
 import (
@@ -14,10 +14,9 @@ import (
 
 	"github.com/go-acme/lego/v4/certcrypto"
 	"github.com/go-acme/lego/v4/certificate"
-	"github.com/go-acme/lego/v4/challenge/http01"
-	"github.com/go-acme/lego/v4/challenge/tlsalpn01"
 	"github.com/go-acme/lego/v4/lego"
 	"github.com/go-acme/lego/v4/registration"
+	"github.com/letsencrypt/challtestsrv"
 )
 
 // ACMEProbe is the exported 'Prober' object for monitors configured to
@@ -83,15 +82,12 @@ func (p ACMEProbe) Probe(timeout time.Duration) (bool, time.Duration) {
 		return false, 0
 	}
 
-	err = client.Challenge.SetHTTP01Provider(
-		http01.NewProviderServer("", "5002"),
-	)
+	challSrvDNS, err := NewDNSProviderChallSrv()
+	// challSrvDNS, err := dns01.NewDNSProviderManual()
 	if err != nil {
 		return false, 0
 	}
-	err = client.Challenge.SetTLSALPN01Provider(
-		tlsalpn01.NewProviderServer("", "5001"),
-	)
+	err = client.Challenge.SetDNS01Provider(challSrvDNS)
 	if err != nil {
 		return false, 0
 	}
@@ -135,4 +131,39 @@ func randString(n int) string {
 		bytes[i] = alphanum[b%byte(len(alphanum))]
 	}
 	return string(bytes)
+}
+
+var challSrv *challtestsrv.ChallSrv
+
+type DNSProviderChallSrv struct{}
+
+func NewDNSProviderChallSrv() (*DNSProviderChallSrv, error) {
+	// Nothing to do if challtestsrv is already running.
+	if challSrv != nil {
+		return &DNSProviderChallSrv{}, nil
+	}
+
+	// Create and start challtestsrv.
+	var err error
+	challSrv, err = challtestsrv.New(challtestsrv.Config{DNSOneAddrs: []string{":5053"}})
+	if err != nil {
+		return nil, err
+	}
+	go challSrv.Run()
+
+	return &DNSProviderChallSrv{}, nil
+}
+
+func (d *DNSProviderChallSrv) Present(domain, token, _ string) error {
+	log.Printf("Presenting domain %s with token %s", domain, token)
+
+	challengeDomain := fmt.Sprintf("_acme-challenge.%s", domain)
+	challSrv.AddDNSOneChallenge(challengeDomain, token)
+
+	return nil
+}
+
+func (d *DNSProviderChallSrv) CleanUp(domain, _, _ string) error {
+	challSrv.DeleteDNSOneChallenge(domain)
+	return nil
 }

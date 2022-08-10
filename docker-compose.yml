@@ -160,6 +160,10 @@ services:
     networks:
       bluenet:
         ipv4_address: 10.77.77.88
+    ports:
+      - "443:5001"
+      - "80:5002"
+      - "53:5053"
     volumes:
       - .:/boulder
     working_dir: *boulder_working_dir
