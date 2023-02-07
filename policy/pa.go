@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 
+	"golang.org/x/exp/slices"
 	"golang.org/x/net/idna"
 	"golang.org/x/text/unicode/norm"
 
@@ -39,10 +40,10 @@ type AuthorityImpl struct {
 }
 
 // New constructs a Policy Authority.
-func New(challengeTypes map[core.AcmeChallenge]bool) (*AuthorityImpl, error) {
+func New(challengeTypes map[core.AcmeChallenge]bool, log blog.Logger) (*AuthorityImpl, error) {
 
 	pa := AuthorityImpl{
-		log:               blog.Get(),
+		log:               log,
 		enabledChallenges: challengeTypes,
 		// We don't need real randomness for this.
 		pseudoRNG: rand.New(rand.NewSource(99)),
@@ -76,14 +77,10 @@ type blockedNamesPolicy struct {
 // SetHostnamePolicyFile will load the given policy file, returning error if it
 // fails. It will also start a reloader in case the file changes
 func (pa *AuthorityImpl) SetHostnamePolicyFile(f string) error {
-	if _, err := reloader.New(f, pa.loadHostnamePolicy, pa.hostnamePolicyLoadError); err != nil {
+	if _, err := reloader.New(f, pa.loadHostnamePolicy, pa.log); err != nil {
 		return err
 	}
 	return nil
-}
-
-func (pa *AuthorityImpl) hostnamePolicyLoadError(err error) {
-	pa.log.AuditErrf("error loading hostname policy: %s", err)
 }
 
 // loadHostnamePolicy is a callback suitable for use with reloader.New() that
@@ -199,7 +196,7 @@ var (
 	errWildcardNotSupported = berrors.MalformedError("Wildcard domain names are not supported")
 )
 
-// ValidDomain checks that a domain isn't:
+// validDomain checks that a domain isn't:
 //
 // * empty
 // * prefixed with the wildcard label `*.`
@@ -213,7 +210,7 @@ var (
 // * exactly equal to an IANA registered TLD
 //
 // It does _not_ check that the domain isn't on any PA blocked lists.
-func ValidDomain(domain string) error {
+func validDomain(domain string) error {
 	if domain == "" {
 		return errEmptyName
 	}
@@ -326,7 +323,7 @@ func ValidEmail(address string) error {
 	}
 	splitEmail := strings.SplitN(email.Address, "@", -1)
 	domain := strings.ToLower(splitEmail[len(splitEmail)-1])
-	err = ValidDomain(domain)
+	err = validDomain(domain)
 	if err != nil {
 		return berrors.InvalidEmailError(
 			"contact email %q has invalid domain : %s",
@@ -340,36 +337,33 @@ func ValidEmail(address string) error {
 	return nil
 }
 
-// WillingToIssue determines whether the CA is willing to issue for the provided
+// willingToIssue determines whether the CA is willing to issue for the provided
 // identifier. It expects domains in id to be lowercase to prevent mismatched
-// cases breaking queries.
+// cases breaking queries. It is a helper method for WillingToIssueWildcards.
 //
 // We place several criteria on identifiers we are willing to issue for:
+//   - MUST self-identify as DNS identifiers
+//   - MUST contain only bytes in the DNS hostname character set
+//   - MUST NOT have more than maxLabels labels
+//   - MUST follow the DNS hostname syntax rules in RFC 1035 and RFC 2181
 //
-//  * MUST self-identify as DNS identifiers
-//  * MUST contain only bytes in the DNS hostname character set
-//  * MUST NOT have more than maxLabels labels
-//  * MUST follow the DNS hostname syntax rules in RFC 1035 and RFC 2181
-//    In particular:
-//    * MUST NOT contain underscores
-//  * MUST NOT match the syntax of an IP address
-//  * MUST end in a public suffix
-//  * MUST have at least one label in addition to the public suffix
-//  * MUST NOT be a label-wise suffix match for a name on the block list,
-//    where comparison is case-independent (normalized to lower case)
+// In particular, it:
+//   - MUST NOT contain underscores
+//   - MUST NOT match the syntax of an IP address
+//   - MUST end in a public suffix
+//   - MUST have at least one label in addition to the public suffix
+//   - MUST NOT be a label-wise suffix match for a name on the block list,
+//     where comparison is case-independent (normalized to lower case)
 //
-// If WillingToIssue returns an error, it will be of type MalformedRequestError
+// If willingToIssue returns an error, it will be of type MalformedRequestError
 // or RejectedIdentifierError
-//
-// TODO(#5816): Consider making this method private, as it has no callers
-// outside of this package.
-func (pa *AuthorityImpl) WillingToIssue(id identifier.ACMEIdentifier) error {
+func (pa *AuthorityImpl) willingToIssue(id identifier.ACMEIdentifier) error {
 	if id.Type != identifier.DNS {
 		return errInvalidIdentifier
 	}
 	domain := id.Value
 
-	err := ValidDomain(domain)
+	err := validDomain(domain)
 	if err != nil {
 		return err
 	}
@@ -390,15 +384,14 @@ func (pa *AuthorityImpl) WillingToIssue(id identifier.ACMEIdentifier) error {
 // All provided identifiers are run through WillingToIssue and any errors are
 // returned. In addition to the regular WillingToIssue checks this function
 // also checks each wildcard identifier to enforce that:
-//
-// * The identifier is a DNS type identifier
-// * There is at most one `*` wildcard character
-// * That the wildcard character is the leftmost label
-// * That the wildcard label is not immediately adjacent to a top level ICANN
-//   TLD
-// * That the wildcard wouldn't cover an exact blocklist entry (e.g. an exact
-//   blocklist entry for "foo.example.com" should prevent issuance for
-//   "*.example.com")
+//   - The identifier is a DNS type identifier
+//   - There is at most one `*` wildcard character
+//   - That the wildcard character is the leftmost label
+//   - That the wildcard label is not immediately adjacent to a top level ICANN
+//     TLD
+//   - That the wildcard wouldn't cover an exact blocklist entry (e.g. an exact
+//     blocklist entry for "foo.example.com" should prevent issuance for
+//     "*.example.com")
 //
 // If any of the identifiers are not valid then an error with suberrors specific
 // to the rejected identifiers will be returned.
@@ -496,13 +489,13 @@ func (pa *AuthorityImpl) willingToIssueWildcard(ident identifier.ACMEIdentifier)
 		// NOTE(@cpu): This is pretty hackish! Boulder issue #3323[0] describes
 		// a better follow-up that we should land to replace this code.
 		// [0] https://github.com/letsencrypt/boulder/issues/3323
-		return pa.WillingToIssue(identifier.ACMEIdentifier{
+		return pa.willingToIssue(identifier.ACMEIdentifier{
 			Type:  identifier.DNS,
 			Value: "x." + baseDomain,
 		})
 	}
 
-	return pa.WillingToIssue(ident)
+	return pa.willingToIssue(ident)
 }
 
 // checkWildcardHostList checks the wildcardExactBlocklist for a given domain.
@@ -545,12 +538,10 @@ func (pa *AuthorityImpl) checkHostLists(domain string) error {
 	return nil
 }
 
-// ChallengesFor makes a decision of what challenges are acceptable for
-// the given identifier.
-func (pa *AuthorityImpl) ChallengesFor(identifier identifier.ACMEIdentifier) ([]core.Challenge, error) {
-	challenges := []core.Challenge{}
-
-	token := core.NewToken()
+// challengesTypesFor determines which challenge types are acceptable for the
+// given identifier.
+func (pa *AuthorityImpl) challengeTypesFor(identifier identifier.ACMEIdentifier) ([]core.AcmeChallenge, error) {
+	var challenges []core.AcmeChallenge
 
 	// If the identifier is for a DNS wildcard name we only
 	// provide a DNS-01 challenge as a matter of CA policy.
@@ -563,20 +554,46 @@ func (pa *AuthorityImpl) ChallengesFor(identifier identifier.ACMEIdentifier) ([]
 					"challenge type is not enabled")
 		}
 		// Only provide a DNS-01-Wildcard challenge
-		challenges = []core.Challenge{core.DNSChallenge01(token)}
+		challenges = []core.AcmeChallenge{core.ChallengeTypeDNS01}
 	} else {
 		// Otherwise we collect up challenges based on what is enabled.
 		if pa.ChallengeTypeEnabled(core.ChallengeTypeHTTP01) {
-			challenges = append(challenges, core.HTTPChallenge01(token))
+			challenges = append(challenges, core.ChallengeTypeHTTP01)
 		}
 
 		if pa.ChallengeTypeEnabled(core.ChallengeTypeTLSALPN01) {
-			challenges = append(challenges, core.TLSALPNChallenge01(token))
+			challenges = append(challenges, core.ChallengeTypeTLSALPN01)
 		}
 
 		if pa.ChallengeTypeEnabled(core.ChallengeTypeDNS01) {
-			challenges = append(challenges, core.DNSChallenge01(token))
+			challenges = append(challenges, core.ChallengeTypeDNS01)
 		}
+	}
+
+	return challenges, nil
+}
+
+// ChallengesFor determines which challenge types are acceptable for the given
+// identifier, and constructs new challenge objects for those challenge types.
+// The resulting challenge objects all share a single challenge token and are
+// returned in a random order.
+func (pa *AuthorityImpl) ChallengesFor(identifier identifier.ACMEIdentifier) ([]core.Challenge, error) {
+	challTypes, err := pa.challengeTypesFor(identifier)
+	if err != nil {
+		return nil, err
+	}
+
+	challenges := make([]core.Challenge, len(challTypes))
+
+	token := core.NewToken()
+
+	for i, t := range challTypes {
+		c, err := core.NewChallenge(t, token)
+		if err != nil {
+			return nil, err
+		}
+
+		challenges[i] = c
 	}
 
 	// We shuffle the challenges to prevent ACME clients from relying on the
@@ -597,4 +614,24 @@ func (pa *AuthorityImpl) ChallengeTypeEnabled(t core.AcmeChallenge) bool {
 	pa.blocklistMu.RLock()
 	defer pa.blocklistMu.RUnlock()
 	return pa.enabledChallenges[t]
+}
+
+// CheckAuthz determines that an authorization was fulfilled by a challenge
+// that was appropriate for the kind of identifier in the authorization.
+func (pa *AuthorityImpl) CheckAuthz(authz *core.Authorization) error {
+	chall, err := authz.SolvedBy()
+	if err != nil {
+		return err
+	}
+
+	challTypes, err := pa.challengeTypesFor(authz.Identifier)
+	if err != nil {
+		return err
+	}
+
+	if !slices.Contains(challTypes, chall) {
+		return errors.New("authorization fulfilled by invalid challenge")
+	}
+
+	return nil
 }

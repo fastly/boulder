@@ -39,7 +39,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io/ioutil"
+	"io"
+	"math/rand"
 	"net/http"
 	"net/url"
 	"time"
@@ -55,7 +56,7 @@ import (
 
 // ErrNotFound indicates the request OCSP response was not found. It is used to
 // indicate that the responder should reply with unauthorizedErrorResponse.
-var ErrNotFound = errors.New("Request OCSP Response not found")
+var ErrNotFound = errors.New("request OCSP Response not found")
 
 // errOCSPResponseExpired indicates that the nextUpdate field of the requested
 // OCSP response occurred in the past and an HTTP status code of 533 should be
@@ -78,12 +79,13 @@ type Responder struct {
 	responseTypes *prometheus.CounterVec
 	responseAges  prometheus.Histogram
 	requestSizes  prometheus.Histogram
+	sampleRate    int
 	clk           clock.Clock
 	log           blog.Logger
 }
 
 // NewResponder instantiates a Responder with the give Source.
-func NewResponder(source Source, timeout time.Duration, stats prometheus.Registerer, logger blog.Logger) *Responder {
+func NewResponder(source Source, timeout time.Duration, stats prometheus.Registerer, logger blog.Logger, sampleRate int) *Responder {
 	requestSizes := prometheus.NewHistogram(
 		prometheus.HistogramOpts{
 			Name:    "ocsp_request_sizes",
@@ -122,6 +124,7 @@ func NewResponder(source Source, timeout time.Duration, stats prometheus.Registe
 		requestSizes:  requestSizes,
 		clk:           clock.New(),
 		log:           logger,
+		sampleRate:    sampleRate,
 	}
 }
 
@@ -150,16 +153,28 @@ var hashToString = map[crypto.Hash]string{
 	crypto.SHA512: "SHA512",
 }
 
+func SampledError(log blog.Logger, sampleRate int, format string, a ...interface{}) {
+	if sampleRate > 0 && rand.Intn(sampleRate) == 0 {
+		log.Errf(format, a...)
+	}
+}
+
+func (rs Responder) sampledError(format string, a ...interface{}) {
+	SampledError(rs.log, rs.sampleRate, format, a...)
+}
+
 // A Responder can process both GET and POST requests. The mapping from an OCSP
 // request to an OCSP response is done by the Source; the Responder simply
 // decodes the request, and passes back whatever response is provided by the
 // source.
 // The Responder will set these headers:
-//   Cache-Control: "max-age=(response.NextUpdate-now), public, no-transform, must-revalidate",
-//   Last-Modified: response.ThisUpdate,
-//   Expires: response.NextUpdate,
-//   ETag: the SHA256 hash of the response, and
-//   Content-Type: application/ocsp-response.
+//
+//	Cache-Control: "max-age=(response.NextUpdate-now), public, no-transform, must-revalidate",
+//	Last-Modified: response.ThisUpdate,
+//	Expires: response.NextUpdate,
+//	ETag: the SHA256 hash of the response, and
+//	Content-Type: application/ocsp-response.
+//
 // Note: The caller must use http.StripPrefix to strip any path components
 // (including '/') on GET requests.
 // Do not use this responder in conjunction with http.NewServeMux, because the
@@ -167,7 +182,11 @@ var hashToString = map[crypto.Hash]string{
 // strings of repeated '/' into a single '/', which will break the base64
 // encoding.
 func (rs Responder) ServeHTTP(response http.ResponseWriter, request *http.Request) {
-	ctx := request.Context()
+	// We specifically ignore request.Context() because we would prefer for clients
+	// to not be able to cancel our operations in arbitrary places. Instead we
+	// start a new context, and apply timeouts in our various RPCs.
+	// TODO(go1.22?): Use context.Detach()
+	ctx := context.Background()
 
 	if rs.timeout != 0 {
 		var cancel func()
@@ -240,7 +259,7 @@ func (rs Responder) ServeHTTP(response http.ResponseWriter, request *http.Reques
 			return
 		}
 	case "POST":
-		requestBody, err = ioutil.ReadAll(http.MaxBytesReader(nil, request.Body, 10000))
+		requestBody, err = io.ReadAll(http.MaxBytesReader(nil, request.Body, 10000))
 		if err != nil {
 			rs.log.Errf("Problem reading body of POST: %s", err)
 			response.WriteHeader(http.StatusBadRequest)
@@ -288,21 +307,21 @@ func (rs Responder) ServeHTTP(response http.ResponseWriter, request *http.Reques
 	ocspResponse, err := rs.Source.Response(ctx, ocspRequest)
 	if err != nil {
 		if errors.Is(err, ErrNotFound) {
-			rs.log.Infof("No response found for request: serial %x, request body %s",
+			rs.sampledError("No response found for request: serial %x, request body %s",
 				ocspRequest.SerialNumber, b64Body)
 			response.Write(ocsp.UnauthorizedErrorResponse)
 			rs.responseTypes.With(prometheus.Labels{"type": responseTypeToString[ocsp.Unauthorized]}).Inc()
 			return
 		} else if errors.Is(err, errOCSPResponseExpired) {
-			rs.log.Infof("Requested ocsp response is expired: serial %x, request body %s",
+			rs.sampledError("Requested ocsp response is expired: serial %x, request body %s",
 				ocspRequest.SerialNumber, b64Body)
 			// HTTP StatusCode - unassigned
 			response.WriteHeader(533)
-			response.Write(ocsp.UnauthorizedErrorResponse)
+			response.Write(ocsp.InternalErrorErrorResponse)
 			rs.responseTypes.With(prometheus.Labels{"type": responseTypeToString[ocsp.Unauthorized]}).Inc()
 			return
 		}
-		rs.log.Infof("Error retrieving response for request: serial %x, request body %s, error: %s",
+		rs.sampledError("Error retrieving response for request: serial %x, request body %s, error: %s",
 			ocspRequest.SerialNumber, b64Body, err)
 		response.WriteHeader(http.StatusInternalServerError)
 		response.Write(ocsp.InternalErrorErrorResponse)

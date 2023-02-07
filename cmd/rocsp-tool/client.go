@@ -3,8 +3,8 @@ package notmain
 import (
 	"context"
 	"fmt"
-	"io/ioutil"
 	"math/rand"
+	"os"
 	"sync/atomic"
 	"time"
 
@@ -20,7 +20,7 @@ import (
 )
 
 type client struct {
-	redis         *rocsp.WritingClient
+	redis         rocsp.Writer
 	db            *db.WrappedMap // optional
 	ocspGenerator capb.OCSPGeneratorClient
 	clk           clock.Clock
@@ -244,7 +244,7 @@ func (e expiredError) Error() string {
 
 func (cl *client) storeResponsesFromFiles(ctx context.Context, files []string) error {
 	for _, respFile := range files {
-		respBytes, err := ioutil.ReadFile(respFile)
+		respBytes, err := os.ReadFile(respFile)
 		if err != nil {
 			return fmt.Errorf("reading response file %q: %w", respFile, err)
 		}

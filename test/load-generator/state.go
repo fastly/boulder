@@ -10,7 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -25,7 +25,7 @@ import (
 	"syscall"
 	"time"
 
-	"gopkg.in/square/go-jose.v2"
+	"gopkg.in/go-jose/go-jose.v2"
 
 	"github.com/letsencrypt/boulder/test/load-generator/acme"
 	"github.com/letsencrypt/challtestsrv"
@@ -228,7 +228,7 @@ func (s *State) Snapshot(filename string) error {
 	if err != nil {
 		return err
 	}
-	return ioutil.WriteFile(filename, cont, os.ModePerm)
+	return os.WriteFile(filename, cont, os.ModePerm)
 }
 
 // Restore previously generated accounts
@@ -241,7 +241,7 @@ func (s *State) Restore(filename string) error {
 		return err
 	}
 
-	content, err := ioutil.ReadAll(f)
+	content, err := io.ReadAll(f)
 	if err != nil {
 		return err
 	}
@@ -277,7 +277,6 @@ func (s *State) Restore(filename string) error {
 // New returns a pointer to a new State struct or an error
 func New(
 	directoryURL string,
-	keySize int,
 	domainBase string,
 	realIP string,
 	maxRegs, maxNamesPerCert int,

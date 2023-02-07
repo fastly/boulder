@@ -2,10 +2,12 @@ package grpc
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
+	"fmt"
 	"log"
 	"net"
-	"net/http"
 	"strconv"
 	"strings"
 	"sync"
@@ -15,13 +17,16 @@ import (
 	"github.com/jmhodges/clock"
 	"github.com/prometheus/client_golang/prometheus"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/balancer/roundrobin"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
 
 	"github.com/letsencrypt/boulder/grpc/test_proto"
 	"github.com/letsencrypt/boulder/metrics"
-	"github.com/letsencrypt/boulder/probs"
 	"github.com/letsencrypt/boulder/test"
 )
 
@@ -47,49 +52,40 @@ func testInvoker(_ context.Context, method string, _, _ interface{}, _ *grpc.Cli
 }
 
 func TestServerInterceptor(t *testing.T) {
-	serverMetrics := NewServerMetrics(metrics.NoopRegisterer)
-	si := newServerInterceptor(serverMetrics, clock.NewFake())
+	serverMetrics, err := newServerMetrics(metrics.NoopRegisterer)
+	test.AssertNotError(t, err, "creating server metrics")
+	si := newServerMetadataInterceptor(serverMetrics, clock.NewFake())
 
 	md := metadata.New(map[string]string{clientRequestTimeKey: "0"})
 	ctxWithMetadata := metadata.NewIncomingContext(context.Background(), md)
 
-	_, err := si.intercept(context.Background(), nil, nil, testHandler)
+	_, err = si.Unary(context.Background(), nil, nil, testHandler)
 	test.AssertError(t, err, "si.intercept didn't fail with a context missing metadata")
 
-	_, err = si.intercept(ctxWithMetadata, nil, nil, testHandler)
+	_, err = si.Unary(ctxWithMetadata, nil, nil, testHandler)
 	test.AssertError(t, err, "si.intercept didn't fail with a nil grpc.UnaryServerInfo")
 
-	_, err = si.intercept(ctxWithMetadata, nil, &grpc.UnaryServerInfo{FullMethod: "-service-test"}, testHandler)
+	_, err = si.Unary(ctxWithMetadata, nil, &grpc.UnaryServerInfo{FullMethod: "-service-test"}, testHandler)
 	test.AssertNotError(t, err, "si.intercept failed with a non-nil grpc.UnaryServerInfo")
 
-	_, err = si.intercept(ctxWithMetadata, 0, &grpc.UnaryServerInfo{FullMethod: "brokeTest"}, testHandler)
+	_, err = si.Unary(ctxWithMetadata, 0, &grpc.UnaryServerInfo{FullMethod: "brokeTest"}, testHandler)
 	test.AssertError(t, err, "si.intercept didn't fail when handler returned a error")
 }
 
 func TestClientInterceptor(t *testing.T) {
-	ci := clientInterceptor{
+	clientMetrics, err := newClientMetrics(metrics.NoopRegisterer)
+	test.AssertNotError(t, err, "creating client metrics")
+	ci := clientMetadataInterceptor{
 		timeout: time.Second,
-		metrics: NewClientMetrics(metrics.NoopRegisterer),
+		metrics: clientMetrics,
 		clk:     clock.NewFake(),
 	}
-	err := ci.intercept(context.Background(), "-service-test", nil, nil, nil, testInvoker)
+
+	err = ci.Unary(context.Background(), "-service-test", nil, nil, nil, testInvoker)
 	test.AssertNotError(t, err, "ci.intercept failed with a non-nil grpc.UnaryServerInfo")
 
-	err = ci.intercept(context.Background(), "-service-brokeTest", nil, nil, nil, testInvoker)
+	err = ci.Unary(context.Background(), "-service-brokeTest", nil, nil, nil, testInvoker)
 	test.AssertError(t, err, "ci.intercept didn't fail when handler returned a error")
-}
-
-func TestCancelTo408Interceptor(t *testing.T) {
-	err := CancelTo408Interceptor(context.Background(), "-service-test", nil, nil, nil, testInvoker)
-	test.AssertNotError(t, err, "CancelTo408Interceptor returned an error when it shouldn't")
-
-	err = CancelTo408Interceptor(context.Background(), "-service-requesterCanceledTest", nil, nil, nil, testInvoker)
-	test.AssertError(t, err, "CancelTo408Interceptor didn't return an error when it should")
-
-	var probDetails *probs.ProblemDetails
-	test.AssertErrorWraps(t, err, &probDetails)
-	test.AssertEquals(t, probDetails.Type, probs.MalformedProblem)
-	test.AssertEquals(t, probDetails.HTTPStatus, http.StatusRequestTimeout)
 }
 
 // TestFailFastFalse sends a gRPC request to a backend that is
@@ -97,15 +93,17 @@ func TestCancelTo408Interceptor(t *testing.T) {
 // timeout is reached, i.e. that FailFast is set to false.
 // https://github.com/grpc/grpc/blob/main/doc/wait-for-ready.md
 func TestFailFastFalse(t *testing.T) {
-	ci := &clientInterceptor{
+	clientMetrics, err := newClientMetrics(metrics.NoopRegisterer)
+	test.AssertNotError(t, err, "creating client metrics")
+	ci := &clientMetadataInterceptor{
 		timeout: 100 * time.Millisecond,
-		metrics: NewClientMetrics(metrics.NoopRegisterer),
+		metrics: clientMetrics,
 		clk:     clock.NewFake(),
 	}
 	conn, err := grpc.Dial("localhost:19876", // random, probably unused port
-		grpc.WithInsecure(),
-		grpc.WithBalancerName("round_robin"),
-		grpc.WithUnaryInterceptor(ci.intercept))
+		grpc.WithDefaultServiceConfig(fmt.Sprintf(`{"loadBalancingConfig": [{"%s":{}}]}`, roundrobin.Name)),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithUnaryInterceptor(ci.Unary))
 	if err != nil {
 		t.Fatalf("did not connect: %v", err)
 	}
@@ -150,9 +148,10 @@ func TestTimeouts(t *testing.T) {
 	}
 	port := lis.Addr().(*net.TCPAddr).Port
 
-	serverMetrics := NewServerMetrics(metrics.NoopRegisterer)
-	si := newServerInterceptor(serverMetrics, clock.NewFake())
-	s := grpc.NewServer(grpc.UnaryInterceptor(si.intercept))
+	serverMetrics, err := newServerMetrics(metrics.NoopRegisterer)
+	test.AssertNotError(t, err, "creating server metrics")
+	si := newServerMetadataInterceptor(serverMetrics, clock.NewFake())
+	s := grpc.NewServer(grpc.UnaryInterceptor(si.Unary))
 	test_proto.RegisterChillerServer(s, &testServer{})
 	go func() {
 		start := time.Now()
@@ -164,14 +163,16 @@ func TestTimeouts(t *testing.T) {
 	defer s.Stop()
 
 	// make client
-	ci := &clientInterceptor{
+	clientMetrics, err := newClientMetrics(metrics.NoopRegisterer)
+	test.AssertNotError(t, err, "creating client metrics")
+	ci := &clientMetadataInterceptor{
 		timeout: 30 * time.Second,
-		metrics: NewClientMetrics(metrics.NoopRegisterer),
+		metrics: clientMetrics,
 		clk:     clock.NewFake(),
 	}
 	conn, err := grpc.Dial(net.JoinHostPort("localhost", strconv.Itoa(port)),
-		grpc.WithInsecure(),
-		grpc.WithUnaryInterceptor(ci.intercept))
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithUnaryInterceptor(ci.Unary))
 	if err != nil {
 		t.Fatalf("did not connect: %v", err)
 	}
@@ -211,9 +212,10 @@ func TestRequestTimeTagging(t *testing.T) {
 	port := lis.Addr().(*net.TCPAddr).Port
 
 	// Create a new ChillerServer
-	serverMetrics := NewServerMetrics(metrics.NoopRegisterer)
-	si := newServerInterceptor(serverMetrics, clk)
-	s := grpc.NewServer(grpc.UnaryInterceptor(si.intercept))
+	serverMetrics, err := newServerMetrics(metrics.NoopRegisterer)
+	test.AssertNotError(t, err, "creating server metrics")
+	si := newServerMetadataInterceptor(serverMetrics, clk)
+	s := grpc.NewServer(grpc.UnaryInterceptor(si.Unary))
 	test_proto.RegisterChillerServer(s, &testServer{})
 	// Chill until ill
 	go func() {
@@ -226,14 +228,16 @@ func TestRequestTimeTagging(t *testing.T) {
 	defer s.Stop()
 
 	// Dial the ChillerServer
-	ci := &clientInterceptor{
+	clientMetrics, err := newClientMetrics(metrics.NoopRegisterer)
+	test.AssertNotError(t, err, "creating client metrics")
+	ci := &clientMetadataInterceptor{
 		timeout: 30 * time.Second,
-		metrics: NewClientMetrics(metrics.NoopRegisterer),
+		metrics: clientMetrics,
 		clk:     clk,
 	}
 	conn, err := grpc.Dial(net.JoinHostPort("localhost", strconv.Itoa(port)),
-		grpc.WithInsecure(),
-		grpc.WithUnaryInterceptor(ci.intercept))
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithUnaryInterceptor(ci.Unary))
 	if err != nil {
 		t.Fatalf("did not connect: %v", err)
 	}
@@ -254,8 +258,9 @@ func TestRequestTimeTagging(t *testing.T) {
 }
 
 // blockedServer implements a ChillerServer with a Chill method that:
-//   a) Calls Done() on the received waitgroup when receiving an RPC
-//   b) Blocks the RPC on the roadblock waitgroup
+//  1. Calls Done() on the received waitgroup when receiving an RPC
+//  2. Blocks the RPC on the roadblock waitgroup
+//
 // This is used by TestInFlightRPCStat to test that the gauge for in-flight RPCs
 // is incremented and decremented as expected.
 type blockedServer struct {
@@ -296,9 +301,10 @@ func TestInFlightRPCStat(t *testing.T) {
 	numRPCs := 5
 	server.received.Add(numRPCs)
 
-	serverMetrics := NewServerMetrics(metrics.NoopRegisterer)
-	si := newServerInterceptor(serverMetrics, clk)
-	s := grpc.NewServer(grpc.UnaryInterceptor(si.intercept))
+	serverMetrics, err := newServerMetrics(metrics.NoopRegisterer)
+	test.AssertNotError(t, err, "creating server metrics")
+	si := newServerMetadataInterceptor(serverMetrics, clk)
+	s := grpc.NewServer(grpc.UnaryInterceptor(si.Unary))
 	test_proto.RegisterChillerServer(s, server)
 	// Chill until ill
 	go func() {
@@ -311,14 +317,16 @@ func TestInFlightRPCStat(t *testing.T) {
 	defer s.Stop()
 
 	// Dial the ChillerServer
-	ci := &clientInterceptor{
+	clientMetrics, err := newClientMetrics(metrics.NoopRegisterer)
+	test.AssertNotError(t, err, "creating client metrics")
+	ci := &clientMetadataInterceptor{
 		timeout: 30 * time.Second,
-		metrics: NewClientMetrics(metrics.NoopRegisterer),
+		metrics: clientMetrics,
 		clk:     clk,
 	}
 	conn, err := grpc.Dial(net.JoinHostPort("localhost", strconv.Itoa(port)),
-		grpc.WithInsecure(),
-		grpc.WithUnaryInterceptor(ci.intercept))
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithUnaryInterceptor(ci.Unary))
 	if err != nil {
 		t.Fatalf("did not connect: %v", err)
 	}
@@ -355,24 +363,75 @@ func TestInFlightRPCStat(t *testing.T) {
 	test.AssertMetricWithLabelsEquals(t, ci.metrics.inFlightRPCs, labels, 0)
 }
 
-func TestNoCancelInterceptor(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	ctx, cancel2 := context.WithDeadline(ctx, time.Now().Add(time.Second))
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		select {
-		case <-ctx.Done():
-			return nil, errors.New("oh no canceled")
-		case <-time.After(50 * time.Millisecond):
-		}
-		return nil, nil
+func TestServiceAuthChecker(t *testing.T) {
+	ac := authInterceptor{
+		map[string]map[string]struct{}{
+			"package.ServiceName": {
+				"allowed.client": {},
+				"also.allowed":   {},
+			},
+		},
 	}
-	go func() {
-		time.Sleep(10 * time.Millisecond)
-		cancel()
-		cancel2()
-	}()
-	_, err := NoCancelInterceptor(ctx, nil, nil, handler)
-	if err != nil {
-		t.Error(err)
-	}
+
+	// No allowlist is a bad configuration.
+	ctx := context.Background()
+	err := ac.checkContextAuth(ctx, "/package.OtherService/Method/")
+	test.AssertError(t, err, "checking empty allowlist")
+
+	// Context with no peering information is disallowed.
+	err = ac.checkContextAuth(ctx, "/package.ServiceName/Method/")
+	test.AssertError(t, err, "checking un-peered context")
+
+	// Context with no auth info is disallowed.
+	ctx = peer.NewContext(ctx, &peer.Peer{})
+	err = ac.checkContextAuth(ctx, "/package.ServiceName/Method/")
+	test.AssertError(t, err, "checking peer with no auth")
+
+	// Context with no verified chains is disallowed.
+	ctx = peer.NewContext(ctx, &peer.Peer{
+		AuthInfo: credentials.TLSInfo{
+			State: tls.ConnectionState{},
+		},
+	})
+	err = ac.checkContextAuth(ctx, "/package.ServiceName/Method/")
+	test.AssertError(t, err, "checking TLS with no valid chains")
+
+	// Context with cert with wrong name is disallowed.
+	ctx = peer.NewContext(ctx, &peer.Peer{
+		AuthInfo: credentials.TLSInfo{
+			State: tls.ConnectionState{
+				VerifiedChains: [][]*x509.Certificate{
+					{
+						&x509.Certificate{
+							DNSNames: []string{
+								"disallowed.client",
+							},
+						},
+					},
+				},
+			},
+		},
+	})
+	err = ac.checkContextAuth(ctx, "/package.ServiceName/Method/")
+	test.AssertError(t, err, "checking disallowed cert")
+
+	// Context with cert with good name is allowed.
+	ctx = peer.NewContext(ctx, &peer.Peer{
+		AuthInfo: credentials.TLSInfo{
+			State: tls.ConnectionState{
+				VerifiedChains: [][]*x509.Certificate{
+					{
+						&x509.Certificate{
+							DNSNames: []string{
+								"disallowed.client",
+								"also.allowed",
+							},
+						},
+					},
+				},
+			},
+		},
+	})
+	err = ac.checkContextAuth(ctx, "/package.ServiceName/Method/")
+	test.AssertNotError(t, err, "checking allowed cert")
 }

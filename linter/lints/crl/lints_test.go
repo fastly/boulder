@@ -107,15 +107,35 @@ func TestIsNotDelta(t *testing.T) {
 	test.AssertContains(t, res.Details, "Delta")
 }
 
-func TestHasNoIDP(t *testing.T) {
+func TestCheckIDP(t *testing.T) {
 	crl := loadPEMCRL(t, "testdata/good.pem")
-	res := hasNoIDP(crl)
+	res := checkIDP(crl)
 	test.AssertEquals(t, res.Status, lint.Pass)
 
-	crl = loadPEMCRL(t, "testdata/idp.pem")
-	res = hasNoIDP(crl)
-	test.AssertEquals(t, res.Status, lint.Notice)
-	test.AssertContains(t, res.Details, "Issuing Distribution Point")
+	crl = loadPEMCRL(t, "testdata/no_idp.pem")
+	res = checkIDP(crl)
+	test.AssertEquals(t, res.Status, lint.Warn)
+	test.AssertContains(t, res.Details, "missing IDP")
+
+	crl = loadPEMCRL(t, "testdata/idp_no_uri.pem")
+	res = checkIDP(crl)
+	test.AssertEquals(t, res.Status, lint.Warn)
+	test.AssertContains(t, res.Details, "should contain distributionPoint")
+
+	crl = loadPEMCRL(t, "testdata/idp_two_uris.pem")
+	res = checkIDP(crl)
+	test.AssertEquals(t, res.Status, lint.Warn)
+	test.AssertContains(t, res.Details, "only one distributionPoint")
+
+	crl = loadPEMCRL(t, "testdata/idp_no_usercerts.pem")
+	res = checkIDP(crl)
+	test.AssertEquals(t, res.Status, lint.Warn)
+	test.AssertContains(t, res.Details, "should contain onlyContainsUserCerts")
+
+	crl = loadPEMCRL(t, "testdata/idp_some_reasons.pem")
+	res = checkIDP(crl)
+	test.AssertEquals(t, res.Status, lint.Warn)
+	test.AssertContains(t, res.Details, "should not contain fields other than")
 }
 
 func TestHasNoFreshest(t *testing.T) {
@@ -250,4 +270,42 @@ func TestHasMozReasonCodes(t *testing.T) {
 	res = hasMozReasonCodes(crl)
 	test.AssertEquals(t, res.Status, lint.Error)
 	test.AssertContains(t, res.Details, "MUST NOT include reasonCodes other than")
+}
+
+func TestHasValidTimestamps(t *testing.T) {
+	crl := loadPEMCRL(t, "testdata/good.pem")
+	res := hasValidTimestamps(crl)
+	test.AssertEquals(t, res.Status, lint.Pass)
+
+	// Check that 'thisUpdate' of 'UTCTIME 500706164338Z' is considered valid.
+	crl = loadPEMCRL(t, "testdata/good_utctime_1950.pem")
+	res = hasValidTimestamps(crl)
+	test.AssertEquals(t, res.Status, lint.Pass)
+
+	// Check that 'thisUpdate' of 'GENERALIZEDTIME 20500706164338Z' is
+	// considered valid.
+	crl = loadPEMCRL(t, "testdata/good_gentime_2050.pem")
+	res = hasValidTimestamps(crl)
+	test.AssertEquals(t, res.Status, lint.Pass)
+
+	// Check that 'thisUpdate' of 'GENERALIZEDTIME 20490706164338Z' (before
+	// 2050) is considered invalid.
+	crl = loadPEMCRL(t, "testdata/gentime_2049.pem")
+	res = hasValidTimestamps(crl)
+	test.AssertEquals(t, res.Status, lint.Error)
+	test.AssertContains(t, res.Details, "timestamps prior to 2050 MUST be encoded using UTCTime")
+
+	// Check that 'nextUpdate' of 'UTCTIME 2207061643Z' (missing seconds) is
+	// considered invalid.
+	crl = loadPEMCRL(t, "testdata/utctime_no_seconds.pem")
+	res = hasValidTimestamps(crl)
+	test.AssertEquals(t, res.Status, lint.Error)
+	test.AssertContains(t, res.Details, "timestamps encoded using UTCTime MUST be specified in the format \"YYMMDDHHMMSSZ\"")
+
+	// Check that 'revocationDate' of 'GENERALIZEDTIME 20490706154338Z' (before
+	// 2050) is considered invalid.
+	crl = loadPEMCRL(t, "testdata/gentime_revoked_2049.pem")
+	res = hasValidTimestamps(crl)
+	test.AssertEquals(t, res.Status, lint.Error)
+	test.AssertContains(t, res.Details, "timestamps prior to 2050 MUST be encoded using UTCTime")
 }

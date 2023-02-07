@@ -3,6 +3,9 @@ package crl
 import (
 	"crypto/x509/pkix"
 	"encoding/asn1"
+	"errors"
+	"fmt"
+	"net/url"
 	"time"
 
 	"github.com/zmap/zlint/v3"
@@ -11,6 +14,11 @@ import (
 	cryptobyte_asn1 "golang.org/x/crypto/cryptobyte/asn1"
 
 	"github.com/letsencrypt/boulder/crl/crl_x509"
+)
+
+const (
+	utcTimeFormat         = "YYMMDDHHMMSSZ"
+	generalizedTimeFormat = "YYYYMMDDHHMMSSZ"
 )
 
 type crlLint func(*crl_x509.RevocationList) *lint.LintResult
@@ -29,7 +37,7 @@ func init() {
 		"hasAKI":                         hasAKI,
 		"hasNumber":                      hasNumber,
 		"isNotDelta":                     isNotDelta,
-		"hasNoIDP":                       hasNoIDP,
+		"checkIDP":                       checkIDP,
 		"hasNoFreshest":                  hasNoFreshest,
 		"hasNoAIA":                       hasNoAIA,
 		"noZeroReasonCodes":              noZeroReasonCodes,
@@ -38,6 +46,7 @@ func init() {
 		"noCriticalReasons":              noCriticalReasons,
 		"noCertificateHolds":             noCertificateHolds,
 		"hasMozReasonCodes":              hasMozReasonCodes,
+		"hasValidTimestamps":             hasValidTimestamps,
 	}
 }
 
@@ -211,17 +220,125 @@ func isNotDelta(crl *crl_x509.RevocationList) *lint.LintResult {
 	return &lint.LintResult{Status: lint.Pass}
 }
 
-// hasNoIDP checks that the CRL does not have an Issuing Distribution Point
-// extension (RFC 5280, Section 5.2.5). There's no requirement against this, but
-// IDPs come with extra requirements we don't want to deal with.
-func hasNoIDP(crl *crl_x509.RevocationList) *lint.LintResult {
+// checkIDP checks that the CRL does have an Issuing Distribution Point, that it
+// is critical, that it contains a single http distributionPointName, that it
+// asserts the onlyContainsUserCerts boolean, and that it does not contain any
+// of the other fields. (RFC 5280, Section 5.2.5).
+func checkIDP(crl *crl_x509.RevocationList) *lint.LintResult {
 	idpOID := asn1.ObjectIdentifier{2, 5, 29, 28} // id-ce-issuingDistributionPoint
-	if getExtWithOID(crl.Extensions, idpOID) != nil {
+	idpe := getExtWithOID(crl.Extensions, idpOID)
+	if idpe == nil {
 		return &lint.LintResult{
-			Status:  lint.Notice,
-			Details: "CRL has an Issuing Distribution Point url",
+			Status:  lint.Warn,
+			Details: "CRL missing IDP",
 		}
 	}
+	if !idpe.Critical {
+		return &lint.LintResult{
+			Status:  lint.Error,
+			Details: "IDP MUST be critical",
+		}
+	}
+
+	// Step inside the outer issuingDistributionPoint sequence to get access to
+	// its constituent fields, DistributionPoint and OnlyContainsUserCerts.
+	idpv := cryptobyte.String(idpe.Value)
+	if !idpv.ReadASN1(&idpv, cryptobyte_asn1.SEQUENCE) {
+		return &lint.LintResult{
+			Status:  lint.Warn,
+			Details: "Failed to read issuingDistributionPoint",
+		}
+	}
+
+	// Ensure that the DistributionPoint is a reasonable URI. To get to the URI,
+	// we have to step inside the DistributionPointName, then step inside that's
+	// FullName, and finally read the singular SEQUENCE OF GeneralName element.
+	if !idpv.PeekASN1Tag(cryptobyte_asn1.Tag(0).ContextSpecific().Constructed()) {
+		return &lint.LintResult{
+			Status:  lint.Warn,
+			Details: "IDP should contain distributionPoint",
+		}
+	}
+
+	var dpName cryptobyte.String
+	if !idpv.ReadASN1(&dpName, cryptobyte_asn1.Tag(0).ContextSpecific().Constructed()) {
+		return &lint.LintResult{
+			Status:  lint.Warn,
+			Details: "Failed to read IDP distributionPoint",
+		}
+	}
+
+	if !dpName.ReadASN1(&dpName, cryptobyte_asn1.Tag(0).ContextSpecific().Constructed()) {
+		return &lint.LintResult{
+			Status:  lint.Warn,
+			Details: "Failed to read IDP distributionPoint fullName",
+		}
+	}
+
+	fmt.Printf("%x\n", dpName)
+	uriBytes := make([]byte, 0)
+	if !dpName.ReadASN1Bytes(&uriBytes, cryptobyte_asn1.Tag(6).ContextSpecific()) {
+		return &lint.LintResult{
+			Status:  lint.Warn,
+			Details: "Failed to read IDP URI",
+		}
+	}
+
+	uri, err := url.Parse(string(uriBytes))
+	if err != nil {
+		return &lint.LintResult{
+			Status:  lint.Error,
+			Details: "Failed to parse IDP URI",
+		}
+	}
+
+	if uri.Scheme != "http" {
+		return &lint.LintResult{
+			Status:  lint.Error,
+			Details: "IDP URI MUST use http scheme",
+		}
+	}
+
+	if !dpName.Empty() {
+		return &lint.LintResult{
+			Status:  lint.Warn,
+			Details: "IDP should contain only one distributionPoint",
+		}
+	}
+
+	// Ensure that OnlyContainsUserCerts is True. We have to read this boolean as
+	// a byte and ensure its value is 0xFF because cryptobyte.ReadASN1Boolean
+	// can't handle custom encoding rules like this field's [1] tag.
+	if !idpv.PeekASN1Tag(cryptobyte_asn1.Tag(1).ContextSpecific()) {
+		return &lint.LintResult{
+			Status:  lint.Warn,
+			Details: "IDP should contain onlyContainsUserCerts",
+		}
+	}
+
+	onlyContainsUserCerts := make([]byte, 0)
+	if !idpv.ReadASN1Bytes(&onlyContainsUserCerts, cryptobyte_asn1.Tag(1).ContextSpecific()) {
+		return &lint.LintResult{
+			Status:  lint.Error,
+			Details: "Failed to read IDP onlyContainsUserCerts",
+		}
+	}
+
+	if len(onlyContainsUserCerts) != 1 || onlyContainsUserCerts[0] != 0xFF {
+		return &lint.LintResult{
+			Status:  lint.Error,
+			Details: "IDP should set onlyContainsUserCerts: TRUE",
+		}
+	}
+
+	// Ensure that no other fields are set.
+	if !idpv.Empty() {
+		return &lint.LintResult{
+			Status:  lint.Warn,
+			Details: "IDP should not contain fields other than distributionPoint and onlyContainsUserCerts",
+		}
+	}
+
 	return &lint.LintResult{Status: lint.Pass}
 }
 
@@ -368,4 +485,176 @@ func hasMozReasonCodes(crl *crl_x509.RevocationList) *lint.LintResult {
 		}
 	}
 	return &lint.LintResult{Status: lint.Pass}
+}
+
+// hasValidTimestamps validates encoding of all CRL timestamp values as
+// specified in section 4.1.2.5 of RFC5280. Timestamp values MUST be encoded as
+// either UTCTime or a GeneralizedTime.
+//
+// UTCTime values MUST be expressed in Greenwich Mean Time (Zulu) and MUST
+// include seconds (i.e., times are YYMMDDHHMMSSZ), even where the number of
+// seconds is zero. See:
+// https://www.rfc-editor.org/rfc/rfc5280.html#section-4.1.2.5.1
+//
+// GeneralizedTime values MUST be expressed in Greenwich Mean Time (Zulu) and
+// MUST include seconds (i.e., times are YYYYMMDDHHMMSSZ), even where the number
+// of seconds is zero.  GeneralizedTime values MUST NOT include fractional
+// seconds. See: https://www.rfc-editor.org/rfc/rfc5280.html#section-4.1.2.5.2
+//
+// Conforming applications MUST encode thisUpdate, nextUpdate, and cerficate
+// validity timestamps prior to 2050 as UTCTime and GeneralizedTime there-after.
+// See:
+//   - https://www.rfc-editor.org/rfc/rfc5280.html#section-5.1.2.4
+//   - https://www.rfc-editor.org/rfc/rfc5280.html#section-5.1.2.5
+//   - https://www.rfc-editor.org/rfc/rfc5280.html#section-5.1.2.6
+func hasValidTimestamps(crl *crl_x509.RevocationList) *lint.LintResult {
+	input := cryptobyte.String(crl.RawTBSRevocationList)
+	lintFail := lint.LintResult{
+		Status:  lint.Error,
+		Details: "Failed to re-parse tbsCertList during linting",
+	}
+
+	// Read tbsCertList.
+	var tbs cryptobyte.String
+	if !input.ReadASN1(&tbs, cryptobyte_asn1.SEQUENCE) {
+		return &lintFail
+	}
+
+	// Skip (optional) version.
+	if !tbs.SkipOptionalASN1(cryptobyte_asn1.INTEGER) {
+		return &lintFail
+	}
+
+	// Skip signature.
+	if !tbs.SkipASN1(cryptobyte_asn1.SEQUENCE) {
+		return &lintFail
+	}
+
+	// Skip issuer.
+	if !tbs.SkipASN1(cryptobyte_asn1.SEQUENCE) {
+		return &lintFail
+	}
+
+	// Read thisUpdate.
+	var thisUpdate cryptobyte.String
+	var thisUpdateTag cryptobyte_asn1.Tag
+	if !tbs.ReadAnyASN1Element(&thisUpdate, &thisUpdateTag) {
+		return &lintFail
+	}
+
+	// Lint thisUpdate.
+	err := lintTimestamp(&thisUpdate, thisUpdateTag)
+	if err != nil {
+		return &lint.LintResult{Status: lint.Error, Details: err.Error()}
+	}
+
+	// Peek (optional) nextUpdate.
+	if tbs.PeekASN1Tag(cryptobyte_asn1.UTCTime) || tbs.PeekASN1Tag(cryptobyte_asn1.GeneralizedTime) {
+		// Read nextUpdate.
+		var nextUpdate cryptobyte.String
+		var nextUpdateTag cryptobyte_asn1.Tag
+		if !tbs.ReadAnyASN1Element(&nextUpdate, &nextUpdateTag) {
+			return &lintFail
+		}
+
+		// Lint nextUpdate.
+		err = lintTimestamp(&nextUpdate, nextUpdateTag)
+		if err != nil {
+			return &lint.LintResult{Status: lint.Error, Details: err.Error()}
+		}
+	}
+
+	// Peek (optional) revokedCertificates.
+	if tbs.PeekASN1Tag(cryptobyte_asn1.SEQUENCE) {
+		// Read sequence of revokedCertificate.
+		var revokedSeq cryptobyte.String
+		if !tbs.ReadASN1(&revokedSeq, cryptobyte_asn1.SEQUENCE) {
+			return &lintFail
+		}
+
+		// Iterate over each revokedCertificate sequence.
+		for !revokedSeq.Empty() {
+			// Read revokedCertificate.
+			var certSeq cryptobyte.String
+			if !revokedSeq.ReadASN1Element(&certSeq, cryptobyte_asn1.SEQUENCE) {
+				return &lintFail
+			}
+
+			if !certSeq.ReadASN1(&certSeq, cryptobyte_asn1.SEQUENCE) {
+				return &lintFail
+			}
+
+			// Skip userCertificate (serial number).
+			if !certSeq.SkipASN1(cryptobyte_asn1.INTEGER) {
+				return &lintFail
+			}
+
+			// Read revocationDate.
+			var revocationDate cryptobyte.String
+			var revocationDateTag cryptobyte_asn1.Tag
+			if !certSeq.ReadAnyASN1Element(&revocationDate, &revocationDateTag) {
+				return &lintFail
+			}
+
+			// Lint revocationDate.
+			err = lintTimestamp(&revocationDate, revocationDateTag)
+			if err != nil {
+				return &lint.LintResult{Status: lint.Error, Details: err.Error()}
+			}
+		}
+	}
+	return &lint.LintResult{Status: lint.Pass}
+}
+
+func lintTimestamp(der *cryptobyte.String, tag cryptobyte_asn1.Tag) error {
+	// Preserve the original timestamp for length checking.
+	derBytes := *der
+	var tsBytes cryptobyte.String
+	if !derBytes.ReadASN1(&tsBytes, tag) {
+		return errors.New("failed to read timestamp")
+	}
+	tsLen := len(string(tsBytes))
+
+	var parsedTime time.Time
+	switch tag {
+	case cryptobyte_asn1.UTCTime:
+		// Verify that the timestamp is properly formatted.
+		if tsLen != len(utcTimeFormat) {
+			return fmt.Errorf("timestamps encoded using UTCTime MUST be specified in the format %q", utcTimeFormat)
+		}
+
+		if !der.ReadASN1UTCTime(&parsedTime) {
+			return errors.New("failed to read timestamp encoded using UTCTime")
+		}
+
+		// Verify that the timestamp is prior to the year 2050. This should
+		// really never happen.
+		if parsedTime.Year() > 2049 {
+			return errors.New("ReadASN1UTCTime returned a UTCTime after 2049")
+		}
+	case cryptobyte_asn1.GeneralizedTime:
+		// Verify that the timestamp is properly formatted.
+		if tsLen != len(generalizedTimeFormat) {
+			return fmt.Errorf(
+				"timestamps encoded using GeneralizedTime MUST be specified in the format %q", generalizedTimeFormat,
+			)
+		}
+
+		if !der.ReadASN1GeneralizedTime(&parsedTime) {
+			return fmt.Errorf("failed to read timestamp encoded using GeneralizedTime")
+		}
+
+		// Verify that the timestamp occurred after the year 2049.
+		if parsedTime.Year() < 2050 {
+			return errors.New("timestamps prior to 2050 MUST be encoded using UTCTime")
+		}
+	default:
+		return errors.New("unsupported time format")
+	}
+
+	// Verify that the location is UTC.
+	if parsedTime.Location() != time.UTC {
+		return errors.New("time must be in UTC")
+	}
+	return nil
 }

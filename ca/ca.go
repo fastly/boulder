@@ -54,9 +54,10 @@ type certificateAuthorityImpl struct {
 	capb.UnimplementedOCSPGeneratorServer
 	sa      sapb.StorageAuthorityCertificateClient
 	pa      core.PolicyAuthority
-	ocsp    *ocspImpl
-	crl     *crlImpl
 	issuers issuerMaps
+	// TODO(#6448): Remove these.
+	ocsp capb.OCSPGeneratorServer
+	crl  capb.CRLGeneratorServer
 
 	// This is temporary, and will be used for testing and slow roll-out
 	// of ECDSA issuance, but will then be removed.
@@ -79,7 +80,7 @@ type certificateAuthorityImpl struct {
 // nearly-unique identifiers of those issuers to the issuers themselves. Note
 // that, if two issuers have the same nearly-unique ID, the *latter* one in
 // the input list "wins".
-func makeIssuerMaps(issuers []*issuance.Issuer) (issuerMaps, error) {
+func makeIssuerMaps(issuers []*issuance.Issuer) issuerMaps {
 	issuersByAlg := make(map[x509.PublicKeyAlgorithm]*issuance.Issuer, 2)
 	issuersByNameID := make(map[issuance.IssuerNameID]*issuance.Issuer, len(issuers))
 	for _, issuer := range issuers {
@@ -92,7 +93,7 @@ func makeIssuerMaps(issuers []*issuance.Issuer) (issuerMaps, error) {
 		}
 		issuersByNameID[issuer.Cert.NameID()] = issuer
 	}
-	return issuerMaps{issuersByAlg, issuersByNameID}, nil
+	return issuerMaps{issuersByAlg, issuersByNameID}
 }
 
 // NewCertificateAuthorityImpl creates a CA instance that can sign certificates
@@ -101,8 +102,8 @@ func makeIssuerMaps(issuers []*issuance.Issuer) (issuerMaps, error) {
 func NewCertificateAuthorityImpl(
 	sa sapb.StorageAuthorityCertificateClient,
 	pa core.PolicyAuthority,
-	ocsp *ocspImpl,
-	crl *crlImpl,
+	ocsp capb.OCSPGeneratorServer,
+	crl capb.CRLGeneratorServer,
 	boulderIssuers []*issuance.Issuer,
 	ecdsaAllowList *ECDSAAllowList,
 	certExpiry time.Duration,
@@ -131,10 +132,8 @@ func NewCertificateAuthorityImpl(
 		err = errors.New("Must have a positive non-zero serial prefix less than 256 for CA.")
 		return nil, err
 	}
-	issuers, err := makeIssuerMaps(boulderIssuers)
-	if err != nil {
-		return nil, err
-	}
+
+	issuers := makeIssuerMaps(boulderIssuers)
 
 	orphanCount := prometheus.NewCounterVec(
 		prometheus.CounterOpts{
@@ -224,7 +223,7 @@ func (ca *certificateAuthorityImpl) IssuePrecertificate(ctx context.Context, iss
 	req := &sapb.AddCertificateRequest{
 		Der:      precertDER,
 		RegID:    regID,
-		Ocsp:     ocspResp.Response,
+		Ocsp:     ocspResp,
 		Issued:   nowNanos,
 		IssuerID: int64(issuerID),
 	}
@@ -241,7 +240,7 @@ func (ca *certificateAuthorityImpl) IssuePrecertificate(ctx context.Context, iss
 			ca.queueOrphan(&orphanedCert{
 				DER:      precertDER,
 				RegID:    regID,
-				OCSPResp: ocspResp.Response,
+				OCSPResp: ocspResp,
 				Precert:  true,
 				IssuerID: int64(issuerID),
 			})
@@ -375,7 +374,7 @@ func (ca *certificateAuthorityImpl) generateSerialNumberAndValidity() (*big.Int,
 	return serialBigInt, validity, nil
 }
 
-func (ca *certificateAuthorityImpl) issuePrecertificateInner(ctx context.Context, issueReq *capb.IssueCertificateRequest, serialBigInt *big.Int, validity validity) ([]byte, *capb.OCSPResponse, *issuance.Issuer, error) {
+func (ca *certificateAuthorityImpl) issuePrecertificateInner(ctx context.Context, issueReq *capb.IssueCertificateRequest, serialBigInt *big.Int, validity validity) ([]byte, []byte, *issuance.Issuer, error) {
 	csr, err := x509.ParseCertificateRequest(issueReq.Csr)
 	if err != nil {
 		return nil, nil, nil, err
@@ -418,16 +417,20 @@ func (ca *certificateAuthorityImpl) issuePrecertificateInner(ctx context.Context
 
 	serialHex := core.SerialToString(serialBigInt)
 
-	// Generate ocsp response before issuing precertificate
-	ocspResp, err := ca.ocsp.GenerateOCSP(ctx, &capb.GenerateOCSPRequest{
-		Serial:   serialHex,
-		IssuerID: int64(issuer.Cert.NameID()),
-		Status:   string(core.OCSPStatusGood),
-	})
-	if err != nil {
-		err = berrors.InternalServerError(err.Error())
-		ca.log.AuditInfof("OCSP Signing for precertificate failure: serial=[%s] err=[%s]", serialHex, err)
-		return nil, nil, nil, err
+	var ocspResp []byte
+	if !features.Enabled(features.ROCSPStage7) {
+		// Generate ocsp response before issuing precertificate
+		ocspRespPB, err := ca.ocsp.GenerateOCSP(ctx, &capb.GenerateOCSPRequest{
+			Serial:   serialHex,
+			IssuerID: int64(issuer.Cert.NameID()),
+			Status:   string(core.OCSPStatusGood),
+		})
+		if err != nil {
+			err = berrors.InternalServerError(err.Error())
+			ca.log.AuditInfof("OCSP Signing for precertificate failure: serial=[%s] err=[%s]", serialHex, err)
+			return nil, nil, nil, err
+		}
+		ocspResp = ocspRespPB.Response
 	}
 
 	ca.log.AuditInfof("Signing precert: serial=[%s] regID=[%d] names=[%s] csr=[%s]",
@@ -475,8 +478,8 @@ func (ca *certificateAuthorityImpl) storeCertificate(
 		err = berrors.InternalServerError(err.Error())
 		// Note: This log line is parsed by cmd/orphan-finder. If you make any
 		// changes here, you should make sure they are reflected in orphan-finder.
-		ca.log.AuditErrf("Failed RPC to store at SA, orphaning certificate: serial=[%s] cert=[%s] err=[%v], regID=[%d], orderID=[%d]",
-			core.SerialToString(serialBigInt), hex.EncodeToString(certDER), err, regID, orderID)
+		ca.log.AuditErrf("Failed RPC to store at SA, orphaning certificate: serial=[%s], cert=[%s], issuerID=[%d], regID=[%d], orderID=[%d], err=[%v]",
+			core.SerialToString(serialBigInt), hex.EncodeToString(certDER), issuerID, regID, orderID, err)
 		if ca.orphanQueue != nil {
 			ca.queueOrphan(&orphanedCert{
 				DER:      certDER,
@@ -582,6 +585,7 @@ func (ca *certificateAuthorityImpl) integrateOrphan() error {
 // GenerateOCSP is simply a passthrough to ocspImpl.GenerateOCSP so that other
 // services which need to talk to the CA anyway can do so without configuring
 // two separate gRPC service backends.
+// TODO(#6448): Remove this passthrough to fully separate the services.
 func (ca *certificateAuthorityImpl) GenerateOCSP(ctx context.Context, req *capb.GenerateOCSPRequest) (*capb.OCSPResponse, error) {
 	return ca.ocsp.GenerateOCSP(ctx, req)
 }
@@ -589,6 +593,7 @@ func (ca *certificateAuthorityImpl) GenerateOCSP(ctx context.Context, req *capb.
 // GenerateCRL is simply a passthrough to crlImpl.GenerateCRL so that other
 // services which need to talk to the CA anyway can do so without configuring
 // two separate gRPC service backends.
+// TODO(#6448): Remove this passthrough to fully separate the services.
 func (ca *certificateAuthorityImpl) GenerateCRL(stream capb.CertificateAuthority_GenerateCRLServer) error {
 	return ca.crl.GenerateCRL(stream)
 }

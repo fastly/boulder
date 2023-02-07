@@ -6,19 +6,19 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"strings"
 	"time"
 
 	"github.com/letsencrypt/boulder/cmd"
+	"github.com/letsencrypt/boulder/db"
 	blog "github.com/letsencrypt/boulder/log"
 	"github.com/letsencrypt/boulder/policy"
 	"github.com/letsencrypt/boulder/sa"
 )
 
 type contactAuditor struct {
-	db            *sql.DB
+	db            *db.WrappedMap
 	resultsFile   *os.File
 	writeToStdout bool
 	logger        blog.Logger
@@ -46,7 +46,7 @@ func validateContacts(id int64, createdAt string, contacts []string) error {
 	// Helper to write validation problems to our buffer.
 	writeProb := func(contact string, prob string) {
 		// Add validation problem to buffer.
-		fmt.Fprintf(&probsBuff, "%d\t%s\tvalidation\t%q\t%q\n", id, createdAt, contact, prob)
+		fmt.Fprintf(&probsBuff, "%d\t%s\tvalidation\t%q\t%q\t%q\n", id, createdAt, contact, prob, contacts)
 	}
 
 	for _, contact := range contacts {
@@ -160,14 +160,14 @@ func main() {
 	logger := cmd.NewLogger(cmd.SyslogConfig{StdoutLevel: 7})
 
 	// Load config from JSON.
-	configData, err := ioutil.ReadFile(*configFile)
+	configData, err := os.ReadFile(*configFile)
 	cmd.FailOnError(err, fmt.Sprintf("Error reading config file: %q", *configFile))
 
 	var cfg Config
 	err = json.Unmarshal(configData, &cfg)
 	cmd.FailOnError(err, "Couldn't unmarshal config")
 
-	db, err := sa.InitSqlDb(cfg.ContactAuditor.DB, nil)
+	db, err := sa.InitWrappedDb(cfg.ContactAuditor.DB, nil, logger)
 	cmd.FailOnError(err, "Couldn't setup database client")
 
 	var resultsFile *os.File

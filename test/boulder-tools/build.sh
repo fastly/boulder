@@ -36,18 +36,16 @@ unzip /tmp/protoc.zip -d /usr/local/protoc
 # Override default GOBIN and GOCACHE
 export GOBIN=/usr/local/bin GOCACHE=/tmp/gocache
 
-# Install golangci-lint
-curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sh -s -- -b $GOBIN v1.46.2
-
 # Install protobuf and testing/dev tools.
 # Note: The version of golang/protobuf is partially tied to the version of grpc
 # used by Boulder overall. Updating it may require updating the grpc version
 # and vice versa.
 go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.28.0
 go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.2.0
-go install bitbucket.org/liamstask/goose/cmd/goose@latest
+go install github.com/rubenv/sql-migrate/...@v1.1.2
 go install golang.org/x/tools/cmd/stringer@latest
 go install github.com/letsencrypt/pebble/cmd/pebble-challtestsrv@master
+go install github.com/golangci/golangci-lint/cmd/golangci-lint@v1.51.0
 
 go clean -cache
 go clean -modcache
@@ -60,7 +58,7 @@ apt-get autoremove -y libssl-dev ruby-dev cmake pkg-config libtool autoconf auto
 apt-get clean -y
 
 # Tell git to trust the directory where the boulder repo volume is mounted
-# by docker-compose.
+# by `docker compose`.
 git config --global --add safe.directory /boulder
 
 rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*

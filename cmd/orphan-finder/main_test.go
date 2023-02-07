@@ -33,7 +33,7 @@ type mockSA struct {
 	clk             clock.FakeClock
 }
 
-func (m *mockSA) AddCertificate(ctx context.Context, req *sapb.AddCertificateRequest, _ ...grpc.CallOption) (*sapb.AddCertificateResponse, error) {
+func (m *mockSA) AddCertificate(ctx context.Context, req *sapb.AddCertificateRequest, _ ...grpc.CallOption) (*emptypb.Empty, error) {
 	parsed, err := x509.ParseCertificate(req.Der)
 	if err != nil {
 		return nil, err
@@ -98,9 +98,9 @@ func (m *mockSA) AddSerial(ctx context.Context, req *sapb.AddSerialRequest, _ ..
 	return &emptypb.Empty{}, nil
 }
 
-type mockCA struct{}
+type mockOCSPA struct{}
 
-func (ca *mockCA) GenerateOCSP(context.Context, *capb.GenerateOCSPRequest, ...grpc.CallOption) (*capb.OCSPResponse, error) {
+func (ca *mockOCSPA) GenerateOCSP(context.Context, *capb.GenerateOCSPRequest, ...grpc.CallOption) (*capb.OCSPResponse, error) {
 	return &capb.OCSPResponse{
 		Response: []byte("HI"),
 	}, nil
@@ -127,7 +127,7 @@ func TestParseLine(t *testing.T) {
 
 	opf := &orphanFinder{
 		sa:       &mockSA{},
-		ca:       &mockCA{},
+		ca:       &mockOCSPA{},
 		logger:   blog.UseMock(),
 		issuers:  map[issuance.IssuerNameID]*issuance.Certificate{issuer.NameID(): issuer},
 		backdate: time.Hour,
@@ -289,7 +289,7 @@ func TestNotOrphan(t *testing.T) {
 	ctx := context.Background()
 	opf := &orphanFinder{
 		sa:       &mockSA{},
-		ca:       &mockCA{},
+		ca:       &mockOCSPA{},
 		logger:   blog.UseMock(),
 		backdate: time.Hour,
 	}

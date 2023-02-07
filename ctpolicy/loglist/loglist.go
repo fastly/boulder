@@ -5,8 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io/ioutil"
 	"math/rand"
+	"os"
 	"strings"
 	"time"
 
@@ -71,7 +71,9 @@ const (
 )
 
 func stateFromState(s *schema.LogListSchemaJsonOperatorsElemLogsElemState) state {
-	if s.Rejected != nil {
+	if s == nil {
+		return unknown
+	} else if s.Rejected != nil {
 		return rejected
 	} else if s.Retired != nil {
 		return retired
@@ -105,7 +107,7 @@ func usableForPurpose(s state, p purpose) bool {
 // the given path. The file must conform to the JSON Schema published by Google:
 // https://www.gstatic.com/ct/log_list/v3/log_list_schema.json
 func New(path string) (List, error) {
-	file, err := ioutil.ReadFile(path)
+	file, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read CT Log List: %w", err)
 	}
@@ -283,7 +285,6 @@ func (ll List) Permute() []string {
 	for i, j := range rand.Perm(len(ll)) {
 		result[i] = keys[j]
 	}
-
 	return result
 }
 
@@ -315,4 +316,8 @@ func (ll List) PickOne(operator string, expiry time.Time) (string, string, error
 
 	log := candidates[rand.Intn(len(candidates))]
 	return log.Url, log.Key, nil
+}
+
+func init() {
+	rand.Seed(time.Now().UnixNano())
 }

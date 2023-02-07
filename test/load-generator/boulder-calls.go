@@ -15,7 +15,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
-	"io/ioutil"
+	"io"
 	mrand "math/rand"
 	"net/http"
 	"time"
@@ -25,7 +25,7 @@ import (
 	"github.com/letsencrypt/boulder/probs"
 	"github.com/letsencrypt/boulder/test/load-generator/acme"
 	"golang.org/x/crypto/ocsp"
-	"gopkg.in/square/go-jose.v2"
+	"gopkg.in/go-jose/go-jose.v2"
 )
 
 var (
@@ -203,7 +203,7 @@ func newOrder(s *State, ctx *context) error {
 		return fmt.Errorf("%s, post failed: %s", newOrderURL, err)
 	}
 	defer resp.Body.Close()
-	body, err := ioutil.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return fmt.Errorf("%s, bad response: %s", newOrderURL, body)
 	}
@@ -248,7 +248,7 @@ func getAuthorization(s *State, ctx *context, url string) (*core.Authorization, 
 
 	// Read the response body
 	defer resp.Body.Close()
-	body, err := ioutil.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, err
 	}
@@ -330,7 +330,7 @@ func completeAuthorization(authz *core.Authorization, s *State, ctx *context) er
 
 	// Read the response body and cleanup when finished
 	defer resp.Body.Close()
-	_, err = ioutil.ReadAll(resp.Body)
+	_, err = io.ReadAll(resp.Body)
 	if err != nil {
 		return err
 	}
@@ -419,7 +419,7 @@ func getOrder(s *State, ctx *context, url string) (*OrderJSON, error) {
 	}
 	// Read the response body
 	defer resp.Body.Close()
-	body, err := ioutil.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("%s, bad response: %s", url, body)
 	}
@@ -538,7 +538,7 @@ func finalizeOrder(s *State, ctx *context) error {
 	defer resp.Body.Close()
 	// Read the body to ensure there isn't an error. We don't need the actual
 	// contents.
-	_, err = ioutil.ReadAll(resp.Body)
+	_, err = io.ReadAll(resp.Body)
 	if err != nil {
 		return err
 	}
@@ -592,7 +592,7 @@ func getCert(s *State, ctx *context, url string) ([]byte, error) {
 		return nil, fmt.Errorf("%s bad response: %s", url, err)
 	}
 	defer resp.Body.Close()
-	return ioutil.ReadAll(resp.Body)
+	return io.ReadAll(resp.Body)
 }
 
 // revokeCertificate removes a certificate url from the context, retrieves it,
@@ -648,7 +648,7 @@ func revokeCertificate(s *State, ctx *context) error {
 	}
 	defer resp.Body.Close()
 
-	_, err = ioutil.ReadAll(resp.Body)
+	_, err = io.ReadAll(resp.Body)
 	if err != nil {
 		return err
 	}

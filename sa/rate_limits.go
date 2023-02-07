@@ -1,7 +1,6 @@
 package sa
 
 import (
-	"context"
 	"strings"
 	"time"
 
@@ -28,15 +27,11 @@ func baseDomain(name string) string {
 	return eTLDPlusOne
 }
 
-// addCertificatesPerName adds 1 to the rate limit count for the provided domains,
-// in a specific time bucket. It must be executed in a transaction, and the
-// input timeToTheHour must be a time rounded to an hour.
-func (ssa *SQLStorageAuthority) addCertificatesPerName(
-	ctx context.Context,
-	db db.SelectExecer,
-	names []string,
-	timeToTheHour time.Time,
-) error {
+// addCertificatesPerName adds 1 to the rate limit count for the provided
+// domains, in a specific time bucket. It must be executed in a transaction, and
+// the input timeToTheHour must be a time rounded to an hour. It assumes that
+// the given db already has a context associated with it.
+func (ssa *SQLStorageAuthority) addCertificatesPerName(db db.SelectExecer, names []string, timeToTheHour time.Time) error {
 	// De-duplicate the base domains.
 	baseDomainsMap := make(map[string]bool)
 	var qmarks []string
@@ -61,37 +56,53 @@ func (ssa *SQLStorageAuthority) addCertificatesPerName(
 }
 
 // countCertificates returns the count of certificates issued for a domain's
-// eTLD+1 (aka base domain), during a given time range.
-func (ssa *SQLStorageAuthority) countCertificates(dbMap db.Selector, domain string, timeRange *sapb.Range) (int64, error) {
-	var counts []int64
+// eTLD+1 (aka base domain), during a given time range. It assumes that the
+// given db already has a context associated with it.
+func (ssa *SQLStorageAuthorityRO) countCertificates(dbMap db.Selector, domain string, timeRange *sapb.Range) (int64, time.Time, error) {
+	latest := time.Unix(0, timeRange.Latest)
+	var results []struct {
+		Count int64
+		Time  time.Time
+	}
 	_, err := dbMap.Select(
-		&counts,
-		`SELECT count FROM certificatesPerName
+		&results,
+		`SELECT count, time FROM certificatesPerName
 		 WHERE eTLDPlusOne = :baseDomain AND
 		 time > :earliest AND
 		 time <= :latest`,
 		map[string]interface{}{
 			"baseDomain": baseDomain(domain),
 			"earliest":   time.Unix(0, timeRange.Earliest),
-			"latest":     time.Unix(0, timeRange.Latest),
+			"latest":     latest,
 		})
 	if err != nil {
 		if db.IsNoRows(err) {
-			return 0, nil
+			return 0, time.Time{}, nil
 		}
-		return 0, err
+		return 0, time.Time{}, err
 	}
+	// Set earliest to the latest possible time, so that we can find the
+	// earliest certificate in the results.
+	var earliest = latest
 	var total int64
-	for _, count := range counts {
-		total += count
+	for _, r := range results {
+		total += r.Count
+		if r.Time.Before(earliest) {
+			earliest = r.Time
+		}
 	}
-	return total, nil
+	if total <= 0 && earliest == latest {
+		// If we didn't find any certificates, return a zero time.
+		return total, time.Time{}, nil
+	}
+	return total, earliest, nil
 }
 
-// addNewOrdersRateLimit adds 1 to the rate limit count for the provided ID,
-// in a specific time bucket. It must be executed in a transaction, and the
-// input timeToTheMinute must be a time rounded to a minute.
-func addNewOrdersRateLimit(ctx context.Context, dbMap db.SelectExecer, regID int64, timeToTheMinute time.Time) error {
+// addNewOrdersRateLimit adds 1 to the rate limit count for the provided ID, in
+// a specific time bucket. It must be executed in a transaction, and the input
+// timeToTheMinute must be a time rounded to a minute. It assumes that the given
+// db already has a context associated with it.
+func addNewOrdersRateLimit(dbMap db.SelectExecer, regID int64, timeToTheMinute time.Time) error {
 	_, err := dbMap.Exec(`INSERT INTO newOrdersRL
 		(regID, time, count)
 		VALUES (?, ?, 1)
@@ -106,8 +117,9 @@ func addNewOrdersRateLimit(ctx context.Context, dbMap db.SelectExecer, regID int
 }
 
 // countNewOrders returns the count of orders created in the given time range
-// for the given registration ID
-func countNewOrders(ctx context.Context, dbMap db.Selector, req *sapb.CountOrdersRequest) (*sapb.Count, error) {
+// for the given registration ID. It assumes that the given db already has a
+// context associated with it.
+func countNewOrders(dbMap db.Selector, req *sapb.CountOrdersRequest) (*sapb.Count, error) {
 	var counts []int64
 	_, err := dbMap.Select(
 		&counts,

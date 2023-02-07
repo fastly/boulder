@@ -16,11 +16,13 @@ import (
 	"sync"
 
 	"github.com/jmhodges/clock"
+	"golang.org/x/term"
 )
 
 // A Logger logs messages with explicit priority levels. It is
 // implemented by a logging back-end as provided by New() or
-// NewMock().
+// NewMock(). Any additions to this interface with format strings should be
+// added to the govet configuration in .golangci.yml
 type Logger interface {
 	Err(msg string)
 	Errf(format string, a ...interface{})
@@ -55,14 +57,50 @@ var _Singleton singleton
 // The constant used to identify audit-specific messages
 const auditTag = "[AUDIT]"
 
-// New returns a new Logger that uses the given syslog.Writer as a backend.
+// New returns a new Logger that uses the given syslog.Writer as a backend
+// and also writes to stdout/stderr. It is safe for concurrent use.
 func New(log *syslog.Writer, stdoutLogLevel int, syslogLogLevel int) (Logger, error) {
 	if log == nil {
 		return nil, errors.New("Attempted to use a nil System Logger.")
 	}
 	return &impl{
-		&bothWriter{log, stdoutLogLevel, syslogLogLevel, clock.New(), os.Stdout},
+		&bothWriter{
+			sync.Mutex{},
+			log,
+			newStdoutWriter(stdoutLogLevel),
+			syslogLogLevel,
+		},
 	}, nil
+}
+
+// StdoutLogger returns a Logger that writes solely to stdout and stderr.
+// It is safe for concurrent use.
+func StdoutLogger(level int) Logger {
+	return &impl{newStdoutWriter(level)}
+}
+
+func newStdoutWriter(level int) *stdoutWriter {
+	shortHostname := "unknown"
+	datacenter := "unknown"
+	hostname, err := os.Hostname()
+	if err == nil {
+		splits := strings.SplitN(hostname, ".", 3)
+		shortHostname = splits[0]
+		if len(splits) > 1 {
+			datacenter = splits[1]
+		}
+	}
+
+	prefix := fmt.Sprintf("%s %s %s[%d]:", shortHostname, datacenter, path.Base(os.Args[0]), os.Getpid())
+
+	return &stdoutWriter{
+		prefix: prefix,
+		level:  level,
+		clk:    clock.New(),
+		stdout: os.Stdout,
+		stderr: os.Stderr,
+		isatty: term.IsTerminal(int(os.Stdout.Fd())),
+	}
 }
 
 // initialize is used in unit tests and called by `Get` before the logger
@@ -114,11 +152,22 @@ type writer interface {
 
 // bothWriter implements writer and writes to both syslog and stdout.
 type bothWriter struct {
+	sync.Mutex
 	*syslog.Writer
-	stdoutLevel int
+	*stdoutWriter
 	syslogLevel int
-	clk         clock.Clock
-	stdout      io.Writer
+}
+
+// stdoutWriter implements writer and writes just to stdout.
+type stdoutWriter struct {
+	// prefix is a set of information that is the same for every log line,
+	// imitating what syslog emits for us when we use the syslog writer.
+	prefix string
+	level  int
+	clk    clock.Clock
+	stdout io.Writer
+	stderr io.Writer
+	isatty bool
 }
 
 func LogLineChecksum(line string) string {
@@ -130,60 +179,83 @@ func LogLineChecksum(line string) string {
 	return base64.RawURLEncoding.EncodeToString(buf)
 }
 
-// Log the provided message at the appropriate level, writing to
+func checkSummed(msg string) string {
+	return fmt.Sprintf("%s %s", LogLineChecksum(msg), msg)
+}
+
+// logAtLevel logs the provided message at the appropriate level, writing to
 // both stdout and the Logger
 func (w *bothWriter) logAtLevel(level syslog.Priority, msg string) {
-	var prefix string
 	var err error
-
-	const red = "\033[31m\033[1m"
-	const yellow = "\033[33m"
 
 	// Since messages are delimited by newlines, we have to escape any internal or
 	// trailing newlines before generating the checksum or outputting the message.
 	msg = strings.Replace(msg, "\n", "\\n", -1)
-	msg = fmt.Sprintf("%s %s", LogLineChecksum(msg), msg)
+
+	w.Lock()
+	defer w.Unlock()
 
 	switch syslogAllowed := int(level) <= w.syslogLevel; level {
 	case syslog.LOG_ERR:
 		if syslogAllowed {
-			err = w.Err(msg)
+			err = w.Err(checkSummed(msg))
 		}
-		prefix = red + "E"
 	case syslog.LOG_WARNING:
 		if syslogAllowed {
-			err = w.Warning(msg)
+			err = w.Warning(checkSummed(msg))
 		}
-		prefix = yellow + "W"
 	case syslog.LOG_INFO:
 		if syslogAllowed {
-			err = w.Info(msg)
+			err = w.Info(checkSummed(msg))
 		}
-		prefix = "I"
 	case syslog.LOG_DEBUG:
 		if syslogAllowed {
-			err = w.Debug(msg)
+			err = w.Debug(checkSummed(msg))
 		}
-		prefix = "D"
 	default:
-		err = w.Err(fmt.Sprintf("%s (unknown logging level: %d)", msg, int(level)))
+		err = w.Err(fmt.Sprintf("%s (unknown logging level: %d)", checkSummed(msg), int(level)))
 	}
 
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to write to syslog: %s (%s)\n", msg, err)
+		fmt.Fprintf(os.Stderr, "Failed to write to syslog: %d %s (%s)\n", int(level), checkSummed(msg), err)
 	}
 
-	var reset string
-	if strings.HasPrefix(prefix, "\033") {
-		reset = "\033[0m"
-	}
+	w.stdoutWriter.logAtLevel(level, msg)
+}
 
-	if int(level) <= w.stdoutLevel {
-		if _, err := fmt.Fprintf(w.stdout, "%s%s %s %s%s\n",
-			prefix,
-			w.clk.Now().Format("150405"),
+// logAtLevel logs the provided message to stdout, or stderr if it is at Warning or Error level.
+func (w *stdoutWriter) logAtLevel(level syslog.Priority, msg string) {
+	if int(level) <= w.level {
+		output := w.stdout
+		if int(level) <= int(syslog.LOG_WARNING) {
+			output = w.stderr
+		}
+
+		msg = strings.Replace(msg, "\n", "\\n", -1)
+
+		var color string
+		var reset string
+
+		const red = "\033[31m\033[1m"
+		const yellow = "\033[33m"
+
+		if w.isatty {
+			if int(level) == int(syslog.LOG_WARNING) {
+				color = yellow
+				reset = "\033[0m"
+			} else if int(level) <= int(syslog.LOG_ERR) {
+				color = red
+				reset = "\033[0m"
+			}
+		}
+
+		if _, err := fmt.Fprintf(output, "%s%s %s %d %s %s%s\n",
+			color,
+			w.clk.Now().UTC().Format("2006-01-02T15:04:05.000000+00:00Z"),
+			w.prefix,
+			int(level),
 			path.Base(os.Args[0]),
-			msg,
+			checkSummed(msg),
 			reset); err != nil {
 			panic(fmt.Sprintf("failed to write to stdout: %v\n", err))
 		}

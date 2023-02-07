@@ -4,11 +4,13 @@ import (
 	"context"
 	"flag"
 	"os"
+	"time"
 
 	"github.com/honeycombio/beeline-go"
 
 	capb "github.com/letsencrypt/boulder/ca/proto"
 	"github.com/letsencrypt/boulder/cmd"
+	cspb "github.com/letsencrypt/boulder/crl/storer/proto"
 	"github.com/letsencrypt/boulder/crl/updater"
 	"github.com/letsencrypt/boulder/features"
 	bgrpc "github.com/letsencrypt/boulder/grpc"
@@ -20,9 +22,9 @@ type Config struct {
 	CRLUpdater struct {
 		cmd.ServiceConfig
 
-		CRLGeneratorService *cmd.GRPCClientConfig
 		SAService           *cmd.GRPCClientConfig
-		// TODO(#6162): Add CRLStorerService stanza
+		CRLGeneratorService *cmd.GRPCClientConfig
+		CRLStorerService    *cmd.GRPCClientConfig
 
 		// IssuerCerts is a list of paths to issuer certificates on disk. This
 		// controls the set of CRLs which will be published by this updater: it will
@@ -35,6 +37,22 @@ type Config struct {
 		// in CCADB MUST be updated.
 		NumShards int
 
+		// ShardWidth is the amount of time (width on a timeline) that a single
+		// shard should cover. Ideally, NumShards*ShardWidth should be an amount of
+		// time noticeably larger than the current longest certificate lifetime,
+		// but the updater will continue to work if this is not the case (albeit
+		// with more confusing mappings of serials to shards).
+		// WARNING: When this number is changed, revocation entries will move
+		// between shards.
+		ShardWidth cmd.ConfigDuration
+
+		// LookbackPeriod is how far back the updater should look for revoked expired
+		// certificates. We are required to include every revoked cert in at least
+		// one CRL, even if it is revoked seconds before it expires, so this must
+		// always be greater than the UpdatePeriod, and should be increased when
+		// recovering from an outage to ensure continuity of coverage.
+		LookbackPeriod cmd.ConfigDuration
+
 		// CertificateLifetime is the validity period (usually expressed in hours,
 		// like "2160h") of the longest-lived currently-unexpired certificate. For
 		// Let's Encrypt, this is usually ninety days. If the validity period of
@@ -42,6 +60,8 @@ type Config struct {
 		// immediately; if the validity period of the issued certificates ever
 		// changes downwards, the value must not change until after all certificates with
 		// the old validity period have expired.
+		// DEPRECATED: This config value is no longer used.
+		// TODO(#6438): Remove this value.
 		CertificateLifetime cmd.ConfigDuration
 
 		// UpdatePeriod controls how frequently the crl-updater runs and publishes
@@ -73,6 +93,7 @@ type Config struct {
 
 func main() {
 	configFile := flag.String("config", "", "File path to the configuration file for this service")
+	debugAddr := flag.String("debug-addr", "", "Debug server address override")
 	runOnce := flag.Bool("runOnce", false, "If true, run once immediately and then exit")
 	flag.Parse()
 	if *configFile == "" {
@@ -83,6 +104,10 @@ func main() {
 	var c Config
 	err := cmd.ReadConfigFile(*configFile, &c)
 	cmd.FailOnError(err, "Reading JSON config file into config structure")
+
+	if *debugAddr != "" {
+		c.CRLUpdater.DebugAddr = *debugAddr
+	}
 
 	err = features.Set(c.CRLUpdater.Features)
 	cmd.FailOnError(err, "Failed to set feature flags")
@@ -107,27 +132,36 @@ func main() {
 		issuers = append(issuers, cert)
 	}
 
-	clientMetrics := bgrpc.NewClientMetrics(scope)
+	if c.CRLUpdater.ShardWidth.Duration == 0 {
+		c.CRLUpdater.ShardWidth.Duration = 16 * time.Hour
+	}
+	if c.CRLUpdater.LookbackPeriod.Duration == 0 {
+		c.CRLUpdater.LookbackPeriod.Duration = 24 * time.Hour
+	}
 
-	caConn, err := bgrpc.ClientSetup(c.CRLUpdater.CRLGeneratorService, tlsConfig, clientMetrics, clk)
+	saConn, err := bgrpc.ClientSetup(c.CRLUpdater.SAService, tlsConfig, scope, clk)
+	cmd.FailOnError(err, "Failed to load credentials and create gRPC connection to SA")
+	sac := sapb.NewStorageAuthorityReadOnlyClient(saConn)
+
+	caConn, err := bgrpc.ClientSetup(c.CRLUpdater.CRLGeneratorService, tlsConfig, scope, clk)
 	cmd.FailOnError(err, "Failed to load credentials and create gRPC connection to CRLGenerator")
 	cac := capb.NewCRLGeneratorClient(caConn)
 
-	saConn, err := bgrpc.ClientSetup(c.CRLUpdater.SAService, tlsConfig, clientMetrics, clk)
-	cmd.FailOnError(err, "Failed to load credentials and create gRPC connection to SA")
-	sac := sapb.NewStorageAuthorityClient(saConn)
-
-	// TODO(#6162): Set up crl-storer client connection.
+	csConn, err := bgrpc.ClientSetup(c.CRLUpdater.CRLStorerService, tlsConfig, scope, clk)
+	cmd.FailOnError(err, "Failed to load credentials and create gRPC connection to CRLStorer")
+	csc := cspb.NewCRLStorerClient(csConn)
 
 	u, err := updater.NewUpdater(
 		issuers,
 		c.CRLUpdater.NumShards,
-		c.CRLUpdater.CertificateLifetime.Duration,
+		c.CRLUpdater.ShardWidth.Duration,
+		c.CRLUpdater.LookbackPeriod.Duration,
 		c.CRLUpdater.UpdatePeriod.Duration,
 		c.CRLUpdater.UpdateOffset.Duration,
 		c.CRLUpdater.MaxParallelism,
 		sac,
 		cac,
+		csc,
 		scope,
 		logger,
 		clk,
@@ -138,9 +172,13 @@ func main() {
 	go cmd.CatchSignals(logger, cancel)
 
 	if *runOnce {
-		u.Tick(ctx)
+		err = u.Tick(ctx, clk.Now())
+		cmd.FailOnError(err, "")
 	} else {
-		u.Run(ctx)
+		err = u.Run(ctx)
+		if err != nil {
+			logger.Err(err.Error())
+		}
 	}
 }
 

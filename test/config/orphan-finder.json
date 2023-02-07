@@ -18,11 +18,13 @@
   },
 
   "ocspGeneratorService": {
-    "serverAddress": "ca.boulder:9096",
-    "timeout": "15s"
+    "serverAddress": "ca.service.consul:9096",
+    "timeout": "15s",
+    "hostOverride": "ca.boulder"
   },
   "saService": {
-    "serverAddress": "sa.boulder:9095",
-    "timeout": "15s"
+    "serverAddress": "sa.service.consul:9095",
+    "timeout": "15s",
+    "hostOverride": "sa.boulder"
   }
 }

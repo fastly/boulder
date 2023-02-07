@@ -3,7 +3,7 @@ package akamai
 import (
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -38,12 +38,11 @@ func TestMakeAuthHeader(t *testing.T) {
 	fc.Set(wantedTimestamp)
 
 	expectedHeader := "EG1-HMAC-SHA256 client_token=akab-client-token-xxx-xxxxxxxxxxxxxxxx;access_token=akab-access-token-xxx-xxxxxxxxxxxxxxxx;timestamp=20140321T19:34:21+0000;nonce=nonce-xx-xxxx-xxxx-xxxx-xxxxxxxxxxxx;signature=hXm4iCxtpN22m4cbZb4lVLW5rhX8Ca82vCFqXzSTPe4="
-	authHeader, err := cpc.makeAuthHeader(
+	authHeader := cpc.makeAuthHeader(
 		[]byte("datadatadatadatadatadatadatadata"),
 		"/testapi/v1/t3",
 		"nonce-xx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
 	)
-	test.AssertNotError(t, err, "Failed to create authorization header")
 	test.AssertEquals(t, authHeader, expectedHeader)
 }
 
@@ -67,7 +66,7 @@ func (as *akamaiServer) purgeHandler(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Objects []string
 	}
-	body, err := ioutil.ReadAll(r.Body)
+	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		fmt.Printf("Failed to read request body: %s\n", err)
 		w.WriteHeader(http.StatusInternalServerError)
@@ -135,8 +134,7 @@ func TestV3Purge(t *testing.T) {
 		metrics.NoopRegisterer,
 	)
 	test.AssertNotError(t, err, "Failed to create CachePurgeClient")
-	fc := clock.NewFake()
-	client.clk = fc
+	client.clk = clock.NewFake()
 
 	err = client.Purge([]string{"http://test.com"})
 	test.AssertNotError(t, err, "Purge failed; expected 201 response")
@@ -146,7 +144,10 @@ func TestV3Purge(t *testing.T) {
 	err = client.Purge([]string{"http://test.com"})
 	test.AssertError(t, err, "Purge succeeded; expected 500 response")
 	t.Log(client.clk.Since(started))
-	test.Assert(t, client.clk.Since(started) > (time.Second*4), "Retries should've taken at least 4.4 seconds")
+	// Given 3 retries, with a retry interval of 1 second, a growth factor of 1.3,
+	// and a jitter of 0.2, the minimum amount of elapsed time is:
+	// (1 * 0.8) + (1 * 1.3 * 0.8) + (1 * 1.3 * 1.3 * 0.8) = 3.192s
+	test.Assert(t, client.clk.Since(started) > (time.Second*3), "Retries should've taken at least 3.192 seconds")
 
 	started = client.clk.Now()
 	as.responseCode = http.StatusCreated

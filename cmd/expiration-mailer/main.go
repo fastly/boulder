@@ -8,7 +8,6 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"io/ioutil"
 	"math"
 	netmail "net/mail"
 	"net/url"
@@ -55,12 +54,20 @@ type mailer struct {
 	nagTimes        []time.Duration
 	parallelSends   uint
 	limit           int
+	// Maximum number of rows to update in a single SQL UPDATE statement.
+	updateChunkSize int
 	clk             clock.Clock
 	stats           mailerStats
 }
 
+type certDERWithRegID struct {
+	DER   core.CertDER
+	RegID int64
+}
+
 type mailerStats struct {
 	sendDelay                         *prometheus.GaugeVec
+	sendDelayHistogram                *prometheus.HistogramVec
 	nagsAtCapacity                    *prometheus.GaugeVec
 	errorCount                        *prometheus.CounterVec
 	sendLatency                       prometheus.Histogram
@@ -192,16 +199,27 @@ func (m *mailer) sendNags(conn bmail.Conn, contacts []string, certs []*x509.Cert
 // the given list. Even though it can encounter errors, it only logs them and
 // does not return them, because we always prefer to simply continue.
 func (m *mailer) updateLastNagTimestamps(ctx context.Context, certs []*x509.Certificate) {
-	qmarks := make([]string, len(certs))
+	for len(certs) > 0 {
+		size := len(certs)
+		if m.updateChunkSize > 0 && size > m.updateChunkSize {
+			size = m.updateChunkSize
+		}
+		chunk := certs[0:size]
+		certs = certs[size:]
+		m.updateLastNagTimestampsChunk(ctx, chunk)
+	}
+}
+
+// updateLastNagTimestampsChunk processes a single chunk (up to 65k) of certificates.
+func (m *mailer) updateLastNagTimestampsChunk(ctx context.Context, certs []*x509.Certificate) {
 	params := make([]interface{}, len(certs)+1)
 	for i, cert := range certs {
-		qmarks[i] = "?"
 		params[i+1] = core.SerialToString(cert.SerialNumber)
 	}
 
 	query := fmt.Sprintf(
 		"UPDATE certificateStatus SET lastExpirationNagSent = ? WHERE serial IN (%s)",
-		strings.Join(qmarks, ","),
+		db.QuestionMarks(len(certs)),
 	)
 	params[0] = m.clk.Now()
 
@@ -226,17 +244,21 @@ func (m *mailer) certIsRenewed(ctx context.Context, names []string, issued time.
 }
 
 type work struct {
-	regID int64
-	certs []core.Certificate
+	regID    int64
+	certDERs []core.CertDER
 }
 
-func (m *mailer) processCerts(ctx context.Context, allCerts []core.Certificate) error {
-	regIDToCerts := make(map[int64][]core.Certificate)
+func (m *mailer) processCerts(
+	ctx context.Context,
+	allCerts []certDERWithRegID,
+	expiresIn time.Duration,
+) error {
+	regIDToCertDERs := make(map[int64][]core.CertDER)
 
 	for _, cert := range allCerts {
-		cs := regIDToCerts[cert.RegistrationID]
-		cs = append(cs, cert)
-		regIDToCerts[cert.RegistrationID] = cs
+		cs := regIDToCertDERs[cert.RegID]
+		cs = append(cs, cert.DER)
+		regIDToCertDERs[cert.RegID] = cs
 	}
 
 	parallelSends := m.parallelSends
@@ -245,12 +267,12 @@ func (m *mailer) processCerts(ctx context.Context, allCerts []core.Certificate) 
 	}
 
 	var wg sync.WaitGroup
-	workChan := make(chan work, len(regIDToCerts))
+	workChan := make(chan work, len(regIDToCertDERs))
 
 	// Populate the work chan on a goroutine so work is available as soon
 	// as one of the sender routines starts.
 	go func(ch chan<- work) {
-		for regID, certs := range regIDToCerts {
+		for regID, certs := range regIDToCertDERs {
 			ch <- work{regID, certs}
 		}
 		close(workChan)
@@ -276,7 +298,7 @@ func (m *mailer) processCerts(ctx context.Context, allCerts []core.Certificate) 
 		go func(conn bmail.Conn, ch <-chan work) {
 			defer wg.Done()
 			for w := range ch {
-				err := m.sendToOneRegID(ctx, conn, w.regID, w.certs)
+				err := m.sendToOneRegID(ctx, conn, w.regID, w.certDERs, expiresIn)
 				if err != nil {
 					m.log.AuditErr(err.Error())
 				}
@@ -288,9 +310,12 @@ func (m *mailer) processCerts(ctx context.Context, allCerts []core.Certificate) 
 	return nil
 }
 
-func (m *mailer) sendToOneRegID(ctx context.Context, conn bmail.Conn, regID int64, certs []core.Certificate) error {
+func (m *mailer) sendToOneRegID(ctx context.Context, conn bmail.Conn, regID int64, certDERs []core.CertDER, expiresIn time.Duration) error {
 	if ctx.Err() != nil {
 		return ctx.Err()
+	}
+	if len(certDERs) == 0 {
+		return errors.New("shouldn't happen: empty certificate list in sendToOneRegID")
 	}
 	reg, err := m.rs.GetRegistration(ctx, &sapb.RegistrationID{Id: regID})
 	if err != nil {
@@ -299,16 +324,24 @@ func (m *mailer) sendToOneRegID(ctx context.Context, conn bmail.Conn, regID int6
 	}
 
 	parsedCerts := []*x509.Certificate{}
-	for _, cert := range certs {
+	for i, certDER := range certDERs {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		parsedCert, err := x509.ParseCertificate(cert.DER)
+		parsedCert, err := x509.ParseCertificate(certDER)
 		if err != nil {
 			// TODO(#1420): tell registration about this error
-			m.log.AuditErrf("Error parsing certificate %s: %s", cert.Serial, err)
+			m.log.AuditErrf("Error parsing certificate: %s. Body: %x", err, certDER)
 			m.stats.errorCount.With(prometheus.Labels{"type": "ParseCertificate"}).Inc()
 			continue
+		}
+
+		// The histogram version of send delay reports the worst case send delay for
+		// a single regID in this cycle.
+		if i == 0 {
+			sendDelay := expiresIn - parsedCert.NotAfter.Sub(m.clk.Now())
+			m.stats.sendDelayHistogram.With(prometheus.Labels{"nag_group": expiresIn.String()}).Observe(
+				sendDelay.Truncate(time.Second).Seconds())
 		}
 
 		renewed, err := m.certIsRenewed(ctx, parsedCert.DNSNames, parsedCert.NotBefore)
@@ -316,7 +349,7 @@ func (m *mailer) sendToOneRegID(ctx context.Context, conn bmail.Conn, regID int6
 			m.log.AuditErrf("expiration-mailer: error fetching renewal state: %v", err)
 			// assume not renewed
 		} else if renewed {
-			m.log.Debugf("Cert %s is already renewed", cert.Serial)
+			m.log.Debugf("Cert %s is already renewed", core.SerialToString(parsedCert.SerialNumber))
 			m.stats.certificatesAlreadyRenewed.Add(1)
 			m.updateLastNagTimestamps(ctx, []*x509.Certificate{parsedCert})
 			continue
@@ -370,36 +403,18 @@ func (m *mailer) findExpiringCertificates(ctx context.Context) error {
 		m.log.Infof("expiration-mailer: Searching for certificates that expire between %s and %s and had last nag >%s before expiry",
 			left.UTC(), right.UTC(), expiresIn)
 
-		// First we do a query on the certificateStatus table to find certificates
-		// nearing expiry meeting our criteria for email notification. We later
-		// sequentially fetch the certificate details. This avoids an expensive
-		// JOIN.
-		var serials []string
-		_, err := m.dbMap.WithContext(ctx).Select(
-			&serials,
-			`SELECT
-				cs.serial
-				FROM certificateStatus AS cs
-				WHERE cs.notAfter > :cutoffA
-				AND cs.notAfter <= :cutoffB
-				AND cs.status != "revoked"
-				AND COALESCE(TIMESTAMPDIFF(SECOND, cs.lastExpirationNagSent, cs.notAfter) > :nagCutoff, 1)
-				ORDER BY cs.notAfter ASC
-				LIMIT :limit`,
-			map[string]interface{}{
-				"cutoffA":   left,
-				"cutoffB":   right,
-				"nagCutoff": expiresIn.Seconds(),
-				"limit":     m.limit,
-			},
-		)
+		var certs []certDERWithRegID
+		var err error
+		if features.Enabled(features.ExpirationMailerUsesJoin) {
+			certs, err = m.getCertsWithJoin(ctx, left, right, expiresIn)
+		} else {
+			certs, err = m.getCerts(ctx, left, right, expiresIn)
+		}
 		if err != nil {
-			m.log.AuditErrf("expiration-mailer: Error loading certificate serials: %s", err)
 			return err
 		}
-		m.log.Debugf("found %d certificates", len(serials))
 
-		m.stats.certificatesExamined.Add(float64(len(serials)))
+		m.stats.certificatesExamined.Add(float64(len(certs)))
 
 		// If the number of rows was exactly `m.limit` rows we need to increment
 		// a stat indicating that this nag group is at capacity based on the
@@ -409,36 +424,12 @@ func (m *mailer) findExpiringCertificates(ctx context.Context) error {
 		//
 		// 0: https://github.com/letsencrypt/boulder/issues/2002
 		atCapacity := float64(0)
-		if len(serials) == m.limit {
+		if len(certs) == m.limit {
 			m.log.Infof("nag group %s expiring certificates at configured capacity (select limit %d)",
 				expiresIn.String(), m.limit)
 			atCapacity = float64(1)
 		}
 		m.stats.nagsAtCapacity.With(prometheus.Labels{"nag_group": expiresIn.String()}).Set(atCapacity)
-
-		// Now we can sequentially retrieve the certificate details for each of the
-		// certificate status rows
-		var certs []core.Certificate
-		for _, serial := range serials {
-			if ctx.Err() != nil {
-				return ctx.Err()
-			}
-			var cert core.Certificate
-			cert, err := sa.SelectCertificate(m.dbMap.WithContext(ctx), serial)
-			if err != nil {
-				// We can get a NoRowsErr when processing a serial number corresponding
-				// to a precertificate with no final certificate. Since this certificate
-				// is not being used by a subscriber, we don't send expiration email about
-				// it.
-				if db.IsNoRows(err) {
-					m.log.Infof("no rows for serial %q", serial)
-					continue
-				}
-				m.log.AuditErrf("expiration-mailer: Error loading cert %q: %s", cert.Serial, err)
-				continue
-			}
-			certs = append(certs, cert)
-		}
 
 		m.log.Infof("Found %d certificates expiring between %s and %s", len(certs),
 			left.Format("2006-01-02 03:04"), right.Format("2006-01-02 03:04"))
@@ -447,14 +438,8 @@ func (m *mailer) findExpiringCertificates(ctx context.Context) error {
 			continue // nothing to do
 		}
 
-		// Report the send delay metric. Note: this is the worst-case send delay
-		// of any certificate in this batch because it's based on the first (oldest).
-		sendDelay := expiresIn - certs[0].Expires.Sub(m.clk.Now())
-		m.stats.sendDelay.With(prometheus.Labels{"nag_group": expiresIn.String()}).Set(
-			sendDelay.Truncate(time.Second).Seconds())
-
 		processingStarted := m.clk.Now()
-		err = m.processCerts(ctx, certs)
+		err = m.processCerts(ctx, certs, expiresIn)
 		if err != nil {
 			m.log.AuditErr(err.Error())
 		}
@@ -464,6 +449,107 @@ func (m *mailer) findExpiringCertificates(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+func (m *mailer) getCertsWithJoin(ctx context.Context, left, right time.Time, expiresIn time.Duration) ([]certDERWithRegID, error) {
+	// First we do a query on the certificateStatus table to find certificates
+	// nearing expiry meeting our criteria for email notification. We later
+	// sequentially fetch the certificate details. This avoids an expensive
+	// JOIN.
+	var certs []certDERWithRegID
+	_, err := m.dbMap.WithContext(ctx).Select(
+		&certs,
+		`SELECT
+				cert.der as der, cert.registrationID as regID
+				FROM certificateStatus AS cs
+				JOIN certificates as cert
+				ON cs.serial = cert.serial
+				AND cs.notAfter > :cutoffA
+				AND cs.notAfter <= :cutoffB
+				AND cs.status != "revoked"
+				AND COALESCE(TIMESTAMPDIFF(SECOND, cs.lastExpirationNagSent, cs.notAfter) > :nagCutoff, 1)
+				ORDER BY cs.notAfter ASC
+				LIMIT :limit`,
+		map[string]interface{}{
+			"cutoffA":   left,
+			"cutoffB":   right,
+			"nagCutoff": expiresIn.Seconds(),
+			"limit":     m.limit,
+		},
+	)
+	if err != nil {
+		m.log.AuditErrf("expiration-mailer: Error loading certificate serials: %s", err)
+		return nil, err
+	}
+	m.log.Debugf("found %d certificates", len(certs))
+	return certs, nil
+}
+
+func (m *mailer) getCerts(ctx context.Context, left, right time.Time, expiresIn time.Duration) ([]certDERWithRegID, error) {
+	// First we do a query on the certificateStatus table to find certificates
+	// nearing expiry meeting our criteria for email notification. We later
+	// sequentially fetch the certificate details. This avoids an expensive
+	// JOIN.
+	var serials []string
+	_, err := m.dbMap.WithContext(ctx).Select(
+		&serials,
+		`SELECT
+				cs.serial
+				FROM certificateStatus AS cs
+				WHERE cs.notAfter > :cutoffA
+				AND cs.notAfter <= :cutoffB
+				AND cs.status != "revoked"
+				AND COALESCE(TIMESTAMPDIFF(SECOND, cs.lastExpirationNagSent, cs.notAfter) > :nagCutoff, 1)
+				ORDER BY cs.notAfter ASC
+				LIMIT :limit`,
+		map[string]interface{}{
+			"cutoffA":   left,
+			"cutoffB":   right,
+			"nagCutoff": expiresIn.Seconds(),
+			"limit":     m.limit,
+		},
+	)
+	if err != nil {
+		m.log.AuditErrf("expiration-mailer: Error loading certificate serials: %s", err)
+		return nil, err
+	}
+	m.log.Debugf("found %d certificates", len(serials))
+
+	// Now we can sequentially retrieve the certificate details for each of the
+	// certificate status rows
+	var certs []certDERWithRegID
+	for i, serial := range serials {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		var cert core.Certificate
+		cert, err := sa.SelectCertificate(m.dbMap.WithContext(ctx), serial)
+		if err != nil {
+			// We can get a NoRowsErr when processing a serial number corresponding
+			// to a precertificate with no final certificate. Since this certificate
+			// is not being used by a subscriber, we don't send expiration email about
+			// it.
+			if db.IsNoRows(err) {
+				m.log.Infof("no rows for serial %q", serial)
+				continue
+			}
+			m.log.AuditErrf("expiration-mailer: Error loading cert %q: %s", cert.Serial, err)
+			continue
+		}
+		certs = append(certs, certDERWithRegID{
+			DER:   cert.DER,
+			RegID: cert.RegistrationID,
+		})
+		if i == 0 {
+			// Report the send delay metric. Note: this is the worst-case send delay
+			// of any certificate in this batch because it's based on the first (oldest).
+			sendDelay := expiresIn - cert.Expires.Sub(m.clk.Now())
+			m.stats.sendDelay.With(prometheus.Labels{"nag_group": expiresIn.String()}).Set(
+				sendDelay.Truncate(time.Second).Seconds())
+		}
+	}
+
+	return certs, nil
 }
 
 type durationSlice []time.Duration
@@ -486,11 +572,23 @@ type Config struct {
 		DB cmd.DBConfig
 		cmd.SMTPConfig
 
-		From    string
+		// From is the "From" address for reminder messages.
+		From string
+
+		// Subject is the Subject line of reminder messages.
+		// This is a Go template with a single variable: ExpirationSubject,
+		// which contains a list of affectd hostnames, possible truncated.
 		Subject string
 
+		// CertLimit is the maximum number of certificates to investigate in a
+		// single batch.
 		CertLimit int
-		NagTimes  []string
+
+		// UpdateChunkSize is the maximum number of rows to update in a single
+		// SQL UPDATE statement.
+		UpdateChunkSize int
+
+		NagTimes []string
 
 		// TODO(#6097): Remove this
 		NagCheckInterval string
@@ -526,6 +624,15 @@ func initStats(stats prometheus.Registerer) mailerStats {
 		},
 		[]string{"nag_group"})
 	stats.MustRegister(sendDelay)
+
+	sendDelayHistogram := prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "send_delay_histogram",
+			Help:    "For each mail sent, difference between the idealized send time and actual send time. Will always be nonzero, bigger numbers are worse",
+			Buckets: prometheus.LinearBuckets(86400, 86400, 10),
+		},
+		[]string{"nag_group"})
+	stats.MustRegister(sendDelayHistogram)
 
 	nagsAtCapacity := prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
@@ -583,6 +690,7 @@ func initStats(stats prometheus.Registerer) mailerStats {
 
 	return mailerStats{
 		sendDelay:                         sendDelay,
+		sendDelayHistogram:                sendDelayHistogram,
 		nagsAtCapacity:                    nagsAtCapacity,
 		errorCount:                        errorCount,
 		sendLatency:                       sendLatency,
@@ -638,14 +746,13 @@ func main() {
 
 	clk := cmd.Clock()
 
-	clientMetrics := bgrpc.NewClientMetrics(scope)
-	conn, err := bgrpc.ClientSetup(c.Mailer.SAService, tlsConfig, clientMetrics, clk)
+	conn, err := bgrpc.ClientSetup(c.Mailer.SAService, tlsConfig, scope, clk)
 	cmd.FailOnError(err, "Failed to load credentials and create gRPC connection to SA")
 	sac := sapb.NewStorageAuthorityClient(conn)
 
 	var smtpRoots *x509.CertPool
 	if c.Mailer.SMTPTrustedRootFile != "" {
-		pem, err := ioutil.ReadFile(c.Mailer.SMTPTrustedRootFile)
+		pem, err := os.ReadFile(c.Mailer.SMTPTrustedRootFile)
 		cmd.FailOnError(err, "Loading trusted roots file")
 		smtpRoots = x509.NewCertPool()
 		if !smtpRoots.AppendCertsFromPEM(pem) {
@@ -654,7 +761,7 @@ func main() {
 	}
 
 	// Load email template
-	emailTmpl, err := ioutil.ReadFile(c.Mailer.EmailTemplate)
+	emailTmpl, err := os.ReadFile(c.Mailer.EmailTemplate)
 	cmd.FailOnError(err, fmt.Sprintf("Could not read email template file [%s]", c.Mailer.EmailTemplate))
 	tmpl, err := template.New("expiry-email").Parse(string(emailTmpl))
 	cmd.FailOnError(err, "Could not parse email template")
@@ -699,6 +806,12 @@ func main() {
 	// Make sure durations are sorted in increasing order
 	sort.Sort(nags)
 
+	if c.Mailer.UpdateChunkSize > 65535 {
+		// MariaDB limits the number of placeholders parameters to max_uint16:
+		// https://github.com/MariaDB/server/blob/10.5/sql/sql_prepare.cc#L2629-L2635
+		cmd.Fail(fmt.Sprintf("UpdateChunkSize of %d is too big", c.Mailer.UpdateChunkSize))
+	}
+
 	m := mailer{
 		log:             logger,
 		dbMap:           dbMap,
@@ -708,6 +821,7 @@ func main() {
 		emailTemplate:   tmpl,
 		nagTimes:        nags,
 		limit:           c.Mailer.CertLimit,
+		updateChunkSize: c.Mailer.UpdateChunkSize,
 		parallelSends:   c.Mailer.ParallelSends,
 		clk:             clk,
 		stats:           initStats(scope),

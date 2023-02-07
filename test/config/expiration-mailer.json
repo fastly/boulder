@@ -20,8 +20,9 @@
       "keyFile": "test/grpc-creds/expiration-mailer.boulder/key.pem"
     },
     "saService": {
-      "serverAddress": "sa.boulder:9095",
-      "timeout": "15s"
+      "serverAddress": "sa.service.consul:9095",
+      "timeout": "15s",
+      "hostOverride": "sa.boulder"
     },
     "SMTPTrustedRootFile": "test/mail-test-srv/minica.pem",
     "frequency": "1h"
@@ -33,6 +34,7 @@
   },
   "beeline": {
       "mute": true,
-      "dataset": "Test"
+      "serviceName": "Test",
+      "writeKey": {"passwordFile": "test/secrets/honeycomb_fake_password"}
   }
 }

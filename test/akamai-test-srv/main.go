@@ -4,7 +4,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"log"
 	"net/http"
 	"sync"
@@ -52,7 +52,7 @@ func main() {
 		var purgeRequest struct {
 			Objects []string `json:"objects"`
 		}
-		body, err := ioutil.ReadAll(r.Body)
+		body, err := io.ReadAll(r.Body)
 		if err != nil {
 			w.WriteHeader(http.StatusBadRequest)
 			fmt.Println("Can't read body:", err)
@@ -92,6 +92,9 @@ func main() {
 		w.Write(resp)
 	})
 
+	// The gosec linter complains that timeouts cannot be set here. That's fine,
+	// because this is test-only code.
+	////nolint:gosec
 	go log.Fatal(http.ListenAndServe(*listenAddr, nil))
 	cmd.CatchSignals(nil, nil)
 }

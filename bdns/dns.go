@@ -117,7 +117,7 @@ var (
 			Mask: []byte{255, 255, 255, 255},
 		},
 		// RFC 6598
-		// 100.64.0.0./10
+		// 100.64.0.0/10
 		{
 			IP:   []byte{100, 64, 0, 0},
 			Mask: []byte{255, 192, 0, 0},
@@ -584,14 +584,14 @@ func logDNSError(
 		}
 
 		logger.Infof(
-			"logDNSError ID mismatch chosenServer=[%s] hostname=[%s] respHostname=[%s] queryType=[%s] err=[%s] msg=[%s] resp=[%s]",
+			"logDNSError ID mismatch chosenServer=[%s] hostname=[%s] respHostname=[%s] queryType=[%s] msg=[%s] resp=[%s] err=[%s]",
 			chosenServer,
 			hostname,
 			respQname,
 			queryType,
-			underlying,
 			encodedMsg,
-			encodedResp)
+			encodedResp,
+			underlying)
 	} else {
 		// Otherwise log a general DNS error
 		logger.Infof("logDNSError chosenServer=[%s] hostname=[%s] queryType=[%s] err=[%s]",

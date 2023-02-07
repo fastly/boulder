@@ -37,7 +37,7 @@ type filterSource struct {
 // by it.
 func NewFilterSource(issuerCerts []*issuance.Certificate, serialPrefixes []string, wrapped Source, stats prometheus.Registerer, log blog.Logger, clk clock.Clock) (*filterSource, error) {
 	if len(issuerCerts) < 1 {
-		return nil, errors.New("Filter must include at least 1 issuer cert")
+		return nil, errors.New("filter must include at least 1 issuer cert")
 	}
 
 	issuersByNameId := make(map[issuance.IssuerNameID]responderID)
@@ -87,7 +87,7 @@ func (src *filterSource) Response(ctx context.Context, req *ocsp.Request) (*Resp
 
 	err = src.checkResponse(iss, resp)
 	if err != nil {
-		src.log.Warningf("OCSP Response not sent for CA=%s, Serial=%s, err: %w", hex.EncodeToString(req.IssuerKeyHash), core.SerialToString(req.SerialNumber), err)
+		src.log.Warningf("OCSP Response not sent for CA=%s, Serial=%s, err: %s", hex.EncodeToString(req.IssuerKeyHash), core.SerialToString(req.SerialNumber), err)
 		src.counter.WithLabelValues("response_filtered").Inc()
 		return nil, err
 	}

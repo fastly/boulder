@@ -10,12 +10,14 @@
       "keyFile": "test/grpc-creds/admin-revoker.boulder/key.pem"
     },
     "raService": {
-      "serverAddress": "ra.boulder:9094",
-      "timeout": "15s"
+      "serverAddress": "ra.service.consul:9094",
+      "timeout": "15s",
+      "hostOverride": "ra.boulder"
     },
     "saService": {
-      "serverAddress": "sa.boulder:9095",
-      "timeout": "15s"
+      "serverAddress": "sa.service.consul:9095",
+      "timeout": "15s",
+      "hostOverride": "sa.boulder"
     },
     "features": {
     }

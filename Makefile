@@ -25,7 +25,7 @@ BUILD_TIME_VAR = github.com/letsencrypt/boulder/core.BuildTime
 
 GO_BUILD_FLAGS = -ldflags "-X \"$(BUILD_ID_VAR)=$(BUILD_ID)\" -X \"$(BUILD_TIME_VAR)=$(BUILD_TIME)\" -X \"$(BUILD_HOST_VAR)=$(BUILD_HOST)\""
 
-.PHONY: all build
+.PHONY: all build build_cmds rpm deb tar
 all: build
 
 build: $(OBJECTS)
@@ -54,7 +54,7 @@ rpm: build
 		--package "$(ARCHIVEDIR)/boulder-$(VERSION)-$(COMMIT_ID).x86_64.rpm" \
 		--description "Boulder is an ACME-compatible X.509 Certificate Authority" \
 		--maintainer "$(MAINTAINER)" \
-		test/config/ sa/_db data/ $(OBJECTS)
+		test/config/ sa/db data/ $(OBJECTS)
 
 deb: build
 	fpm -f -s dir -t deb --name "boulder" \
@@ -64,4 +64,10 @@ deb: build
 		--package "$(ARCHIVEDIR)/boulder-$(VERSION)-$(COMMIT_ID).x86_64.deb" \
 		--description "Boulder is an ACME-compatible X.509 Certificate Authority" \
 		--maintainer "$(MAINTAINER)" \
-		test/config/ sa/_db data/ $(OBJECTS) bin/ct-test-srv
+		test/config/ sa/db data/ $(OBJECTS) bin/ct-test-srv
+
+tar: build
+	fpm -f -s dir -t tar --name "boulder" --prefix=/opt/boulder \
+		--package "$(ARCHIVEDIR)/boulder-$(VERSION)-$(COMMIT_ID).amd64.tar" \
+		test/config/ sa/db data/ $(OBJECTS)
+	gzip -f "$(ARCHIVEDIR)/boulder-$(VERSION)-$(COMMIT_ID).amd64.tar"

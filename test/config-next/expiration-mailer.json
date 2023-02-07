@@ -10,6 +10,7 @@
       "maxOpenConns": 10
     },
     "certLimit": 100000,
+    "updateChunkSize": 1000,
     "nagTimes": ["480h", "240h"],
     "emailTemplate": "test/config-next/expiration-mailer.gotmpl",
     "debugAddr": ":8008",
@@ -20,22 +21,27 @@
       "keyFile": "test/grpc-creds/expiration-mailer.boulder/key.pem"
     },
     "saService": {
-      "serverAddress": "sa.boulder:9095",
-      "timeout": "15s"
+      "srvLookup": {
+        "service": "sa",
+        "domain": "service.consul"
+      },
+      "timeout": "15s",
+      "hostOverride": "sa.boulder"
     },
     "SMTPTrustedRootFile": "test/mail-test-srv/minica.pem",
     "frequency": "1h",
     "features": {
-      "ExpirationMailerDontLookTwice": true
+      "ExpirationMailerUsesJoin": true
     }
   },
 
   "syslog": {
     "stdoutlevel": 6,
-    "sysloglevel": 6
+    "sysloglevel": -1
   },
   "beeline": {
       "mute": true,
-      "dataset": "Test"
+      "serviceName": "Test",
+      "writeKey": {"passwordFile": "test/secrets/honeycomb_fake_password"}
   }
 }

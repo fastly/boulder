@@ -1,7 +1,6 @@
 package policy
 
 import (
-	"io/ioutil"
 	"os"
 	"testing"
 
@@ -9,6 +8,7 @@ import (
 	berrors "github.com/letsencrypt/boulder/errors"
 	"github.com/letsencrypt/boulder/features"
 	"github.com/letsencrypt/boulder/identifier"
+	blog "github.com/letsencrypt/boulder/log"
 	"github.com/letsencrypt/boulder/test"
 	"gopkg.in/yaml.v3"
 )
@@ -19,7 +19,7 @@ var enabledChallenges = map[core.AcmeChallenge]bool{
 }
 
 func paImpl(t *testing.T) *AuthorityImpl {
-	pa, err := New(enabledChallenges)
+	pa, err := New(enabledChallenges, blog.NewMock())
 	if err != nil {
 		t.Fatalf("Couldn't create policy implementation: %s", err)
 	}
@@ -151,9 +151,9 @@ func TestWillingToIssue(t *testing.T) {
 
 	yamlPolicyBytes, err := yaml.Marshal(policy)
 	test.AssertNotError(t, err, "Couldn't YAML serialize blocklist")
-	yamlPolicyFile, _ := ioutil.TempFile("", "test-blocklist.*.yaml")
+	yamlPolicyFile, _ := os.CreateTemp("", "test-blocklist.*.yaml")
 	defer os.Remove(yamlPolicyFile.Name())
-	err = ioutil.WriteFile(yamlPolicyFile.Name(), yamlPolicyBytes, 0640)
+	err = os.WriteFile(yamlPolicyFile.Name(), yamlPolicyBytes, 0640)
 	test.AssertNotError(t, err, "Couldn't write YAML blocklist")
 
 	pa := paImpl(t)
@@ -163,7 +163,7 @@ func TestWillingToIssue(t *testing.T) {
 
 	// Test for invalid identifier type
 	ident := identifier.ACMEIdentifier{Type: "ip", Value: "example.com"}
-	err = pa.WillingToIssue(ident)
+	err = pa.willingToIssue(ident)
 	if err != errInvalidIdentifier {
 		t.Error("Identifier was not correctly forbidden: ", ident)
 	}
@@ -171,27 +171,27 @@ func TestWillingToIssue(t *testing.T) {
 	// Test syntax errors
 	for _, tc := range testCases {
 		ident := identifier.DNSIdentifier(tc.domain)
-		err := pa.WillingToIssue(ident)
+		err := pa.willingToIssue(ident)
 		if err != tc.err {
 			t.Errorf("WillingToIssue(%q) = %q, expected %q", tc.domain, err, tc.err)
 		}
 	}
 
 	// Invalid encoding
-	err = pa.WillingToIssue(identifier.DNSIdentifier("www.xn--m.com"))
+	err = pa.willingToIssue(identifier.DNSIdentifier("www.xn--m.com"))
 	test.AssertError(t, err, "WillingToIssue didn't fail on a malformed IDN")
 	// Valid encoding
-	err = pa.WillingToIssue(identifier.DNSIdentifier("www.xn--mnich-kva.com"))
+	err = pa.willingToIssue(identifier.DNSIdentifier("www.xn--mnich-kva.com"))
 	test.AssertNotError(t, err, "WillingToIssue failed on a properly formed IDN")
 	// IDN TLD
-	err = pa.WillingToIssue(identifier.DNSIdentifier("xn--example--3bhk5a.xn--p1ai"))
+	err = pa.willingToIssue(identifier.DNSIdentifier("xn--example--3bhk5a.xn--p1ai"))
 	test.AssertNotError(t, err, "WillingToIssue failed on a properly formed domain with IDN TLD")
 	features.Reset()
 
 	// Test domains that are equal to public suffixes
 	for _, domain := range shouldBeTLDError {
 		ident := identifier.DNSIdentifier(domain)
-		err := pa.WillingToIssue(ident)
+		err := pa.willingToIssue(ident)
 		if err != errICANNTLD {
 			t.Error("Identifier was not correctly forbidden: ", ident, err)
 		}
@@ -200,7 +200,7 @@ func TestWillingToIssue(t *testing.T) {
 	// Test expected blocked domains
 	for _, domain := range shouldBeBlocked {
 		ident := identifier.DNSIdentifier(domain)
-		err := pa.WillingToIssue(ident)
+		err := pa.willingToIssue(ident)
 		if err != errPolicyForbidden {
 			t.Error("Identifier was not correctly forbidden: ", ident, err)
 		}
@@ -209,7 +209,7 @@ func TestWillingToIssue(t *testing.T) {
 	// Test acceptance of good names
 	for _, domain := range shouldBeAccepted {
 		ident := identifier.DNSIdentifier(domain)
-		err := pa.WillingToIssue(ident)
+		err := pa.willingToIssue(ident)
 		test.AssertNotError(t, err, "identiier was incorrectly forbidden")
 	}
 }
@@ -228,9 +228,9 @@ func TestWillingToIssueWildcard(t *testing.T) {
 		ExactBlockedNames:    exactBannedDomains,
 	})
 	test.AssertNotError(t, err, "Couldn't serialize banned list")
-	f, _ := ioutil.TempFile("", "test-wildcard-banlist.*.yaml")
+	f, _ := os.CreateTemp("", "test-wildcard-banlist.*.yaml")
 	defer os.Remove(f.Name())
-	err = ioutil.WriteFile(f.Name(), bannedBytes, 0640)
+	err = os.WriteFile(f.Name(), bannedBytes, 0640)
 	test.AssertNotError(t, err, "Couldn't write serialized banned list to file")
 	err = pa.SetHostnamePolicyFile(f.Name())
 	test.AssertNotError(t, err, "Couldn't load policy contents from file")
@@ -319,9 +319,9 @@ func TestWillingToIssueWildcards(t *testing.T) {
 		ExactBlockedNames:    banned,
 	})
 	test.AssertNotError(t, err, "Couldn't serialize banned list")
-	f, _ := ioutil.TempFile("", "test-wildcard-banlist.*.yaml")
+	f, _ := os.CreateTemp("", "test-wildcard-banlist.*.yaml")
 	defer os.Remove(f.Name())
-	err = ioutil.WriteFile(f.Name(), bannedBytes, 0640)
+	err = os.WriteFile(f.Name(), bannedBytes, 0640)
 	test.AssertNotError(t, err, "Couldn't write serialized banned list to file")
 	err = pa.SetHostnamePolicyFile(f.Name())
 	test.AssertNotError(t, err, "Couldn't load policy contents from file")
@@ -395,7 +395,7 @@ func TestChallengesForWildcard(t *testing.T) {
 	}
 
 	mustConstructPA := func(t *testing.T, enabledChallenges map[core.AcmeChallenge]bool) *AuthorityImpl {
-		pa, err := New(enabledChallenges)
+		pa, err := New(enabledChallenges, blog.NewMock())
 		test.AssertNotError(t, err, "Couldn't create policy implementation")
 		return pa
 	}
@@ -445,10 +445,10 @@ func TestMalformedExactBlocklist(t *testing.T) {
 	test.AssertNotError(t, err, "Couldn't serialize banned list")
 
 	// Create a temp file for the YAML contents
-	f, _ := ioutil.TempFile("", "test-invalid-exactblocklist.*.yaml")
+	f, _ := os.CreateTemp("", "test-invalid-exactblocklist.*.yaml")
 	defer os.Remove(f.Name())
 	// Write the YAML to the temp file
-	err = ioutil.WriteFile(f.Name(), bannedBytes, 0640)
+	err = os.WriteFile(f.Name(), bannedBytes, 0640)
 	test.AssertNotError(t, err, "Couldn't write serialized banned list to file")
 
 	// Try to use the YAML tempfile as the hostname policy. It should produce an

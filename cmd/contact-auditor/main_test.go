@@ -3,7 +3,6 @@ package notmain
 import (
 	"context"
 	"fmt"
-	"io/ioutil"
 	"net"
 	"os"
 	"strings"
@@ -11,7 +10,6 @@ import (
 	"time"
 
 	"github.com/jmhodges/clock"
-	"github.com/letsencrypt/boulder/cmd"
 	corepb "github.com/letsencrypt/boulder/core/proto"
 	"github.com/letsencrypt/boulder/db"
 	blog "github.com/letsencrypt/boulder/log"
@@ -85,7 +83,7 @@ func TestContactAuditor(t *testing.T) {
 	}
 
 	// Load results file.
-	data, err := ioutil.ReadFile(testCtx.c.resultsFile.Name())
+	data, err := os.ReadFile(testCtx.c.resultsFile.Name())
 	if err != nil {
 		t.Error(err)
 	}
@@ -94,9 +92,9 @@ func TestContactAuditor(t *testing.T) {
 	contentLines := strings.Split(strings.TrimRight(string(data), "\n"), "\n")
 	test.AssertEquals(t, len(contentLines), 2)
 
-	// Each result entry should contain five tab separated columns.
+	// Each result entry should contain six tab separated columns.
 	for _, line := range contentLines {
-		test.AssertEquals(t, len(strings.Split(line, "\t")), 5)
+		test.AssertEquals(t, len(strings.Split(line, "\t")), 6)
 	}
 }
 
@@ -187,23 +185,23 @@ func setup(t *testing.T) testCtx {
 	}
 
 	// Make temp results file
-	file, err := ioutil.TempFile("", fmt.Sprintf("audit-%s", time.Now().Format("2006-01-02T15:04")))
+	file, err := os.CreateTemp("", fmt.Sprintf("audit-%s", time.Now().Format("2006-01-02T15:04")))
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	cleanUp := func() {
-		test.ResetSATestDatabase(t)
+		test.ResetBoulderTestDatabase(t)
 		file.Close()
 		os.Remove(file.Name())
 	}
 
-	db, err := sa.InitSqlDb(cmd.DBConfig{DBConnect: vars.DBConnSAMailer}, nil)
+	db, err := sa.NewDbMap(vars.DBConnSAMailer, sa.DbSettings{})
 	if err != nil {
 		t.Fatalf("Couldn't connect to the database: %s", err)
 	}
 
-	ssa, err := sa.NewSQLStorageAuthority(dbMap, dbMap, nil, clock.New(), log, metrics.NoopRegisterer, 1)
+	ssa, err := sa.NewSQLStorageAuthority(dbMap, dbMap, nil, 1, clock.New(), log, metrics.NoopRegisterer)
 	if err != nil {
 		t.Fatalf("unable to create SQLStorageAuthority: %s", err)
 	}

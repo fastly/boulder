@@ -2,21 +2,13 @@
   "va": {
     "userAgent": "boulder-remote-a",
     "debugAddr": ":8011",
-    "portConfig": {
-      "httpPort": 5002,
-      "httpsPort": 5001,
-      "tlsPort": 5001
-    },
     "dnsTries": 3,
-    "dnsResolvers": [
-      "127.0.0.1:8053",
-      "127.0.0.1:8054"
-    ],
+    "dnsResolver": "service.consul",
     "issuerDomain": "happy-hacker-ca.invalid",
     "tls": {
       "caCertfile": "test/grpc-creds/minica.pem",
-      "certFile": "test/grpc-creds/va.boulder/cert.pem",
-      "keyFile": "test/grpc-creds/va.boulder/key.pem"
+      "certFile": "test/grpc-creds/rva.boulder/cert.pem",
+      "keyFile": "test/grpc-creds/rva.boulder/key.pem"
     },
     "grpc": {
       "maxConnectionAge": "30s",
@@ -26,13 +18,10 @@
         "va.boulder"
       ]
     },
-    "features": {
-      "CAAValidationMethods": true,
-      "CAAAccountURI": true
-    },
+    "features": {},
     "accountURIPrefixes": [
-      "http://boulder:4000/acme/reg/",
-      "http://boulder:4001/acme/acct/"
+      "http://boulder.service.consul:4000/acme/reg/",
+      "http://boulder.service.consul:4001/acme/acct/"
     ]
   },
 
@@ -42,7 +31,8 @@
   },
   "beeline": {
       "mute": true,
-      "dataset": "Test"
+      "serviceName": "Test",
+      "writeKey": {"passwordFile": "test/secrets/honeycomb_fake_password"}
   },
 
   "common": {

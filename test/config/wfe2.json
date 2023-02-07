@@ -6,11 +6,11 @@
     "serverKeyPath": "test/wfe-tls/boulder/key.pem",
     "allowOrigins": ["*"],
     "shutdownStopTimeout": "10s",
-    "subscriberAgreementURL": "https://boulder:4431/terms/v7",
+    "subscriberAgreementURL": "https://boulder.service.consul:4431/terms/v7",
     "debugAddr": ":8013",
     "directoryCAAIdentity": "happy-hacker-ca.invalid",
     "directoryWebsite": "https://github.com/letsencrypt/boulder",
-    "legacyKeyIDPrefix": "http://boulder:4000/reg/",
+    "legacyKeyIDPrefix": "http://boulder.service.consul:4000/reg/",
     "goodkey": {
       "blockedKeyFile": "test/example-blocked-keys.yaml"
     },
@@ -20,29 +20,34 @@
       "keyFile": "test/grpc-creds/wfe.boulder/key.pem"
     },
     "raService": {
-      "serverAddress": "ra.boulder:9094",
-      "timeout": "15s"
+      "serverAddress": "ra.service.consul:9094",
+      "timeout": "15s",
+      "hostOverride": "ra.boulder"
     },
     "saService": {
-      "serverAddress": "sa.boulder:9095",
-      "timeout": "15s"
+      "serverAddress": "sa.service.consul:9095",
+      "timeout": "15s",
+      "hostOverride": "sa.boulder"
     },
     "accountCache": {
       "size": 9000,
       "ttl": "5s"
     },
     "getNonceService": {
-      "serverAddress": "nonce.boulder:9101",
-      "timeout": "15s"
+      "serverAddress": "nonce.service.consul:9101",
+      "timeout": "15s",
+      "hostOverride": "nonce.boulder"
     },
     "redeemNonceServices": {
       "taro": {
-        "serverAddress": "nonce1.boulder:9101",
-        "timeout": "15s"
+        "serverAddress": "nonce1.service.consul:9101",
+        "timeout": "15s",
+        "hostOverride": "nonce1.boulder"
       },
       "zinc": {
-        "serverAddress": "nonce2.boulder:9101",
-        "timeout": "15s"
+        "serverAddress": "nonce2.service.consul:9101",
+        "timeout": "15s",
+        "hostOverride": "nonce2.boulder"
       }
     },
     "chains": [
@@ -66,10 +71,7 @@
     "staleTimeout": "5m",
     "authorizationLifetimeDays": 30,
     "pendingAuthorizationLifetimeDays": 7,
-    "features": {
-      "PrecertificateRevocation": true,
-      "StripDefaultSchemePort": true
-    }
+    "features": {}
   },
 
   "syslog": {
@@ -78,6 +80,7 @@
   },
   "beeline": {
       "mute": true,
-      "dataset": "Test"
+      "serviceName": "Test",
+      "writeKey": {"passwordFile": "test/secrets/honeycomb_fake_password"}
   }
 }

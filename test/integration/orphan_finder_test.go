@@ -11,7 +11,6 @@ import (
 	"encoding/pem"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
 	"math/big"
 	"os"
@@ -24,8 +23,8 @@ import (
 	"github.com/letsencrypt/pkcs11key/v4"
 )
 
-var template = `[AUDIT] Failed RPC to store at SA, orphaning precertificate: serial=[%x] cert=[%x] err=[sa.StorageAuthority.AddCertificate timed out after 5000 ms], issuerID=[1], regID=[1], orderID=[1]
-[AUDIT] Failed RPC to store at SA, orphaning certificate: serial=[%x] cert=[%x] err=[sa.StorageAuthority.AddCertificate timed out after 5000 ms], issuerID=[1], regID=[1], orderID=[1]`
+var template = `[AUDIT] Failed RPC to store at SA, orphaning precertificate: serial=[%x], cert=[%x], issuerID=[1], regID=[1], orderID=[1], err=[sa.StorageAuthority.AddPrecertificate timed out after 5000 ms]
+[AUDIT] Failed RPC to store at SA, orphaning certificate: serial=[%x], cert=[%x], issuerID=[1], regID=[1], orderID=[1], err=[sa.StorageAuthority.AddCertificate timed out after 5000 ms]`
 
 // TestOrphanFinder runs the orphan-finder with an example input file. This must
 // be run after other tests so the account ID 1 exists (since the inserted
@@ -40,11 +39,11 @@ func TestOrphanFinder(t *testing.T) {
 	if err != nil {
 		log.Fatal(err)
 	}
-	f, _ := ioutil.TempFile("", "orphaned.log")
+	f, _ := os.CreateTemp("", "orphaned.log")
 	io.WriteString(f, fmt.Sprintf(template, precert.SerialNumber.Bytes(),
 		precert.Raw, cert.SerialNumber.Bytes(), cert.Raw))
 	f.Close()
-	cmd := exec.Command("./bin/orphan-finder", "parse-ca-log",
+	cmd := exec.Command("./bin/boulder", "orphan-finder", "parse-ca-log",
 		"--config", "./"+os.Getenv("BOULDER_CONFIG_DIR")+"/orphan-finder.json",
 		"--log-file", f.Name())
 	out, err := cmd.Output()
@@ -75,7 +74,7 @@ func makeFakeCert(precert bool) (*x509.Certificate, error) {
 	if err != nil {
 		return nil, err
 	}
-	pubKeyBytes, err := ioutil.ReadFile("/hierarchy/intermediate-signing-pub-rsa.pem")
+	pubKeyBytes, err := os.ReadFile("/hierarchy/intermediate-signing-pub-rsa.pem")
 	if err != nil {
 		return nil, err
 	}
@@ -88,7 +87,7 @@ func makeFakeCert(precert bool) (*x509.Certificate, error) {
 		return nil, fmt.Errorf("parsing issuer public key: %s", err)
 	}
 	var pkcs11Config pkcs11key.Config
-	contents, err := ioutil.ReadFile("test/test-ca.key-pkcs11.json")
+	contents, err := os.ReadFile("test/test-ca.key-pkcs11.json")
 	if err != nil {
 		return nil, err
 	}
@@ -115,7 +114,7 @@ func makeFakeCert(precert bool) (*x509.Certificate, error) {
 	}
 	if precert {
 		template.ExtraExtensions = []pkix.Extension{
-			pkix.Extension{
+			{
 				Id:       OIDExtensionCTPoison,
 				Critical: true,
 				Value:    []byte{5, 0},

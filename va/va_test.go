@@ -19,7 +19,6 @@ import (
 
 	"github.com/jmhodges/clock"
 	"github.com/letsencrypt/boulder/bdns"
-	"github.com/letsencrypt/boulder/cmd"
 	"github.com/letsencrypt/boulder/core"
 	corepb "github.com/letsencrypt/boulder/core/proto"
 	"github.com/letsencrypt/boulder/features"
@@ -31,7 +30,7 @@ import (
 	vapb "github.com/letsencrypt/boulder/va/proto"
 	"github.com/prometheus/client_golang/prometheus"
 	"google.golang.org/grpc"
-	"gopkg.in/square/go-jose.v2"
+	"gopkg.in/go-jose/go-jose.v2"
 )
 
 var expectedToken = "LoqXcYV8q5ONbJQxbmR7SCTNo3tiAXDfowyjxAjEuX0"
@@ -77,7 +76,7 @@ func TestMain(m *testing.M) {
 	os.Exit(ret)
 }
 
-var accountURIPrefixes = []string{"http://boulder:4000/acme/reg/"}
+var accountURIPrefixes = []string{"http://boulder.service.consul:4000/acme/reg/"}
 
 func createValidationRequest(domain string, challengeType core.AcmeChallenge) *vapb.PerformValidationRequest {
 	return &vapb.PerformValidationRequest{
@@ -91,7 +90,7 @@ func createValidationRequest(domain string, challengeType core.AcmeChallenge) *v
 		},
 		Authz: &vapb.AuthzMeta{
 			Id:    "",
-			RegID: 0,
+			RegID: 1,
 		},
 	}
 }
@@ -123,17 +122,7 @@ func setup(srv *httptest.Server, maxRemoteFailures int, userAgent string, remote
 		userAgent = "user agent 1.0"
 	}
 
-	var portConfig cmd.PortConfig
-	if srv != nil {
-		port := getPort(srv)
-		portConfig = cmd.PortConfig{
-			HTTPPort: port,
-			TLSPort:  port,
-		}
-	}
 	va, err := NewValidationAuthorityImpl(
-		// Use the test server's port as both the HTTPPort and the TLSPort for the VA
-		&portConfig,
 		&bdns.MockClient{Log: logger},
 		nil,
 		maxRemoteFailures,
@@ -144,6 +133,15 @@ func setup(srv *httptest.Server, maxRemoteFailures int, userAgent string, remote
 		logger,
 		accountURIPrefixes,
 	)
+
+	// Adjusting industry regulated ACME challenge port settings is fine during
+	// testing
+	if srv != nil {
+		port := getPort(srv)
+		va.httpPort = port
+		va.tlsPort = port
+	}
+
 	if err != nil {
 		panic(fmt.Sprintf("Failed to create validation authority: %v", err))
 	}
@@ -153,12 +151,9 @@ func setup(srv *httptest.Server, maxRemoteFailures int, userAgent string, remote
 	return va, logger
 }
 
-func setupRemote(srv *httptest.Server, maxRemoteFailures int, userAgent string) (vapb.VAClient, *blog.Mock) {
-	innerVA, mockLog := setup(srv, maxRemoteFailures, userAgent, nil)
-	res := localRemoteVA{
-		remote: *innerVA,
-	}
-	return &res, mockLog
+func setupRemote(srv *httptest.Server, userAgent string) vapb.VAClient {
+	innerVA, _ := setup(srv, 0, userAgent, nil)
+	return &localRemoteVA{remote: *innerVA}
 }
 
 type multiSrv struct {
@@ -177,6 +172,7 @@ func (s *multiSrv) setAllowedUAs(allowedUAs map[string]bool) {
 const slowRemoteSleepMillis = 1000
 
 func httpMultiSrv(t *testing.T, token string, allowedUAs map[string]bool) *multiSrv {
+	t.Helper()
 	m := http.NewServeMux()
 
 	server := httptest.NewUnstartedServer(m)
@@ -328,8 +324,8 @@ func TestMultiVA(t *testing.T) {
 	ms := httpMultiSrv(t, expectedToken, allowedUAs)
 	defer ms.Close()
 
-	remoteVA1, _ := setupRemote(ms.Server, 0, remoteUA1)
-	remoteVA2, _ := setupRemote(ms.Server, 0, remoteUA2)
+	remoteVA1 := setupRemote(ms.Server, remoteUA1)
+	remoteVA2 := setupRemote(ms.Server, remoteUA2)
 
 	remoteVAs := []RemoteVA{
 		{remoteVA1, remoteUA1},
@@ -538,8 +534,8 @@ func TestMultiVAEarlyReturn(t *testing.T) {
 	ms := httpMultiSrv(t, expectedToken, allowedUAs)
 	defer ms.Close()
 
-	remoteVA1, _ := setupRemote(ms.Server, 0, remoteUA1)
-	remoteVA2, _ := setupRemote(ms.Server, 0, remoteUA2)
+	remoteVA1 := setupRemote(ms.Server, remoteUA1)
+	remoteVA2 := setupRemote(ms.Server, remoteUA2)
 
 	remoteVAs := []RemoteVA{
 		{remoteVA1, remoteUA1},
@@ -626,8 +622,8 @@ func TestMultiVAPolicy(t *testing.T) {
 	ms := httpMultiSrv(t, expectedToken, allowedUAs)
 	defer ms.Close()
 
-	remoteVA1, _ := setupRemote(ms.Server, 0, remoteUA1)
-	remoteVA2, _ := setupRemote(ms.Server, 0, remoteUA2)
+	remoteVA1 := setupRemote(ms.Server, remoteUA1)
+	remoteVA2 := setupRemote(ms.Server, remoteUA2)
 
 	remoteVAs := []RemoteVA{
 		{remoteVA1, remoteUA1},
@@ -709,9 +705,9 @@ func TestDetailedError(t *testing.T) {
 
 func TestLogRemoteValidationDifferentials(t *testing.T) {
 	// Create some remote VAs
-	remoteVA1, _ := setupRemote(nil, 0, "remote 1")
-	remoteVA2, _ := setupRemote(nil, 0, "remote 2")
-	remoteVA3, _ := setupRemote(nil, 0, "remote 3")
+	remoteVA1 := setupRemote(nil, "remote 1")
+	remoteVA2 := setupRemote(nil, "remote 2")
+	remoteVA3 := setupRemote(nil, "remote 3")
 	remoteVAs := []RemoteVA{
 		{remoteVA1, "remote 1"},
 		{remoteVA2, "remote 2"},

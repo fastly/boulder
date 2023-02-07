@@ -1,20 +1,17 @@
 version: '3'
 services:
   boulder:
-    # CAUTION: Changing the Go version in this tag changes the version of Go
-    # used for release builds. make-deb.sh relies on being able to parse the
-    # numeric version between 'go' and the underscore-prefixed date. If you make
-    # changes to these tokens, please update this parsing logic.
-    image: &boulder_image letsencrypt/boulder-tools:${BOULDER_TOOLS_TAG:-go1.18.4_2022-07-20}
+    # When updating the Go version here, please also update
+    # .github/workflows/release.yml and .github/workflows/try-release.yml
+    image: &boulder_image letsencrypt/boulder-tools:${BOULDER_TOOLS_TAG:-go1.19.5_2023-02-02}
     environment:
-      FAKE_DNS: 10.77.77.88
-      BOULDER_CONFIG_DIR: test/config
+      FAKE_DNS: 10.77.77.77
+      BOULDER_CONFIG_DIR: &boulder_config_dir test/config
       GOFLAGS: -mod=vendor
-      # Go 1.18 turns off SHA-1 validation on CSRs (and certs, but that doesn't
-      # affect us). It also turns off TLS 1.0 and TLS 1.1. Temporarily go back
-      # to allowing these so we can upgrade to Go 1.18 while doing a deprecation
-      # window. These overrides will stop working in Go 1.19.
-      GODEBUG: x509sha1=1,tls10default=1
+      # Go 1.18 turned off SHA-1 validation on CSRs (and certs, but that doesn't
+      # affect us) by default, but it can be turned back on with the x509sha1
+      # flag. This override will stop working in an unknown future release.
+      GODEBUG: x509sha1=1
     volumes:
       - .:/boulder:cached
       - ./.gocache:/root/.cache/go-build:cached
@@ -27,17 +24,17 @@ services:
         ipv4_address: 10.88.88.88
       redisnet:
         ipv4_address: 10.33.33.33
+      consulnet:
+        ipv4_address: 10.55.55.55
     extra_hosts:
       # This is used by TestOldTLS in va/http_test.go
       # TODO(#6011): Remove once TLS 1.0 and 1.1 support is gone.
       - "example.com:127.0.0.1"
-    # Use sd-test-srv as a backup to Docker's embedded DNS server
+    # Use consul as a backup to Docker's embedded DNS server If there's a name
+    # Docker's DNS server doesn't know about, it will forward the query to this
+    # IP (running consul).
     # (https://docs.docker.com/config/containers/container-networking/#dns-services).
-    # If there's a name Docker's DNS server doesn't know about, it will
-    # forward the query to this IP (running sd-test-srv). We have
-    # special logic there that will return multiple IP addresses for
-    # service names.
-    dns: 10.77.77.77
+    dns: 10.55.55.10
     ports:
       - 4001:4001 # ACMEv2
       - 4002:4002 # OCSP
@@ -45,6 +42,7 @@ services:
     depends_on:
       - bmysql
       - bredis_clusterer
+      - bconsul
     entrypoint: test/entrypoint.sh
     working_dir: &boulder_working_dir /boulder
 
@@ -55,7 +53,7 @@ services:
         aliases:
           - boulder-mysql
     environment:
-        MYSQL_ALLOW_EMPTY_PASSWORD: "yes"
+      MYSQL_ALLOW_EMPTY_PASSWORD: "yes"
     # Send slow queries to a table so we can check for them in the
     # integration tests. For now we ignore queries not using indexes,
     # because that seems to trigger based on the optimizer's choice to not
@@ -63,64 +61,67 @@ services:
     # small.
     command: mysqld --bind-address=0.0.0.0 --slow-query-log --log-output=TABLE --log-queries-not-using-indexes=ON
     logging:
-        driver: none
-
+      driver: none
+  # TODO(#6517): replace all bredis_ services with those from
+  # docker-compose.next.yml.
   bredis_1:
     image: redis:6.2.7
     volumes:
       - ./test/:/test/:cached
-    command: redis-server /test/redis.config
+    command: redis-server /test/redis-cluster.config
     networks:
       redisnet:
-          ipv4_address: 10.33.33.2
+        ipv4_address: 10.33.33.2
 
   bredis_2:
     image: redis:6.2.7
     volumes:
       - ./test/:/test/:cached
-    command: redis-server /test/redis.config
+    command: redis-server /test/redis-cluster.config
     networks:
       redisnet:
-          ipv4_address: 10.33.33.3
+        ipv4_address: 10.33.33.3
 
   bredis_3:
     image: redis:6.2.7
     volumes:
       - ./test/:/test/:cached
-    command: redis-server /test/redis.config
+    command: redis-server /test/redis-cluster.config
     networks:
       redisnet:
-          ipv4_address: 10.33.33.4
+        ipv4_address: 10.33.33.4
 
   bredis_4:
     image: redis:6.2.7
     volumes:
       - ./test/:/test/:cached
-    command: redis-server /test/redis.config
+    command: redis-server /test/redis-cluster.config
     networks:
       redisnet:
-          ipv4_address: 10.33.33.5
+        ipv4_address: 10.33.33.5
 
   bredis_5:
     image: redis:6.2.7
     volumes:
       - ./test/:/test/:cached
-    command: redis-server /test/redis.config
+    command: redis-server /test/redis-cluster.config
     networks:
       redisnet:
-          ipv4_address: 10.33.33.6
+        ipv4_address: 10.33.33.6
 
   bredis_6:
     image: redis:6.2.7
     volumes:
       - ./test/:/test/:cached
-    command: redis-server /test/redis.config
+    command: redis-server /test/redis-cluster.config
     networks:
       redisnet:
-          ipv4_address: 10.33.33.7
-
+        ipv4_address: 10.33.33.7
+  # TODO(#6517): remove bredis_clusterer.
   bredis_clusterer:
     image: redis:6.2.7
+    environment:
+      BOULDER_CONFIG_DIR: *boulder_config_dir
     volumes:
       - ./test/:/test/:cached
       - ./cluster/:/cluster/:cached
@@ -133,17 +134,26 @@ services:
       - bredis_5
       - bredis_6
     networks:
-        redisnet:
-          ipv4_address: 10.33.33.10
-          aliases:
-            - boulder-redis-clusterer
+      redisnet:
+        ipv4_address: 10.33.33.10
+        aliases:
+          - boulder-redis-clusterer
+
+  bconsul:
+    image: hashicorp/consul:1.13.1
+    volumes:
+     - ./test/:/test/:cached
+    networks:
+      consulnet:
+        ipv4_address: 10.55.55.10
+    command: "consul agent -dev -config-format=hcl -config-file=/test/consul/config.hcl"
 
   netaccess:
     image: *boulder_image
     environment:
-        GO111MODULE: "on"
-        GOFLAGS: -mod=vendor
-        BOULDER_CONFIG_DIR: test/config
+      GO111MODULE: "on"
+      GOFLAGS: -mod=vendor
+      BOULDER_CONFIG_DIR: *boulder_config_dir
     networks:
       - bluenet
     volumes:
@@ -199,3 +209,10 @@ networks:
       driver: default
       config:
         - subnet: 10.33.33.0/24
+
+  consulnet:
+    driver: bridge
+    ipam:
+      driver: default
+      config:
+        - subnet: 10.55.55.0/24

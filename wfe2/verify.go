@@ -7,7 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -15,12 +15,13 @@ import (
 
 	"github.com/honeycombio/beeline-go"
 	"github.com/prometheus/client_golang/prometheus"
-	"gopkg.in/square/go-jose.v2"
+	"gopkg.in/go-jose/go-jose.v2"
 
 	"github.com/letsencrypt/boulder/core"
 	berrors "github.com/letsencrypt/boulder/errors"
 	"github.com/letsencrypt/boulder/grpc"
 	"github.com/letsencrypt/boulder/nonce"
+	noncepb "github.com/letsencrypt/boulder/nonce/proto"
 	"github.com/letsencrypt/boulder/probs"
 	sapb "github.com/letsencrypt/boulder/sa/proto"
 	"github.com/letsencrypt/boulder/web"
@@ -195,17 +196,27 @@ func (wfe *WebFrontEndImpl) validNonce(ctx context.Context, jws *jose.JSONWebSig
 		wfe.stats.joseErrorCount.With(prometheus.Labels{"type": "JWSMissingNonce"}).Inc()
 		return probs.BadNonce("JWS has no anti-replay nonce")
 	}
-	var nonceValid bool
-	if wfe.remoteNonceService != nil {
-		valid, err := nonce.RemoteRedeem(ctx, wfe.noncePrefixMap, header.Nonce)
+	var valid bool
+	var err error
+	if wfe.noncePrefixMap == nil {
+		// Dispatch nonce redemption RPCs dynamically.
+		ctx = context.WithValue(ctx, nonce.PrefixCtxKey{}, header.Nonce[:nonce.PrefixLen])
+		ctx = context.WithValue(ctx, nonce.HMACKeyCtxKey{}, wfe.rncKey)
+		resp, err := wfe.rnc.Redeem(ctx, &noncepb.NonceMessage{Nonce: header.Nonce})
 		if err != nil {
-			return probs.ServerInternal(fmt.Sprintf("failed to verify nonce validity: %s", err))
+			return web.ProblemDetailsForError(err, "failed to redeem nonce")
 		}
-		nonceValid = valid
+		valid = resp.Valid
 	} else {
-		nonceValid = wfe.nonceService.Valid(header.Nonce)
+		// Dispatch nonce redpemption RPCs using a static mapping.
+		//
+		// TODO(#6610) Remove code below and the `npm` mapping.
+		valid, err = nonce.RemoteRedeem(ctx, wfe.noncePrefixMap, header.Nonce)
+		if err != nil {
+			return web.ProblemDetailsForError(err, "failed to redeem nonce")
+		}
 	}
-	if !nonceValid {
+	if !valid {
 		wfe.stats.joseErrorCount.With(prometheus.Labels{"type": "JWSInvalidNonce"}).Inc()
 		return probs.BadNonce(fmt.Sprintf("JWS has an invalid anti-replay nonce: %q", header.Nonce))
 	}
@@ -354,7 +365,7 @@ func (wfe *WebFrontEndImpl) parseJWSRequest(request *http.Request) (*jose.JSONWe
 
 	// Read the POST request body's bytes. validPOSTRequest has already checked
 	// that the body is non-nil
-	bodyBytes, err := ioutil.ReadAll(http.MaxBytesReader(nil, request.Body, maxRequestSize))
+	bodyBytes, err := io.ReadAll(http.MaxBytesReader(nil, request.Body, maxRequestSize))
 	if err != nil {
 		if err.Error() == "http: request body too large" {
 			return nil, probs.Unauthorized("request body too large")
@@ -469,9 +480,8 @@ func (wfe *WebFrontEndImpl) lookupJWK(
 		// a ServerInternal problem since this is unexpected.
 		wfe.stats.joseErrorCount.With(prometheus.Labels{"type": "JWSKeyIDLookupFailed"}).Inc()
 		// Add an error to the log event with the internal error message
-		logEvent.AddError(fmt.Sprintf("Error calling SA.GetRegistration: %s", err.Error()))
-		return nil, nil, probs.ServerInternal(fmt.Sprintf(
-			"Error retrieving account %q", accountURL))
+		logEvent.AddError("calling SA.GetRegistration: %s", err)
+		return nil, nil, web.ProblemDetailsForError(err, fmt.Sprintf("Error retrieving account %q", accountURL))
 	}
 
 	// Verify the account is not deactivated
@@ -731,8 +741,7 @@ func (wfe *WebFrontEndImpl) validKeyRollover(
 	ctx context.Context,
 	outerJWS *jose.JSONWebSignature,
 	innerJWS *jose.JSONWebSignature,
-	oldKey *jose.JSONWebKey,
-	logEvent *web.RequestEvent) (*rolloverOperation, *probs.ProblemDetails) {
+	oldKey *jose.JSONWebKey) (*rolloverOperation, *probs.ProblemDetails) {
 
 	// Extract the embedded JWK from the inner JWS
 	jwk, prob := wfe.extractJWK(innerJWS)

@@ -13,7 +13,6 @@ import (
 	"encoding/asn1"
 	"encoding/base64"
 	"fmt"
-	"io/ioutil"
 	"math/big"
 	"os"
 	"strings"
@@ -418,11 +417,10 @@ func TestGenerateTemplate(t *testing.T) {
 			},
 		},
 	}
-	fc := clock.NewFake()
-	fc.Set(time.Time{}.Add(time.Hour))
+
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			template := tc.profile.generateTemplate(fc)
+			template := tc.profile.generateTemplate()
 			test.AssertDeepEquals(t, *template, *tc.expectedTemplate)
 		})
 	}
@@ -790,8 +788,8 @@ func TestLoadChain_Unloadable(t *testing.T) {
 	})
 	test.AssertError(t, err, "Should reject unloadable chain")
 
-	invalidPEMFile, _ := ioutil.TempFile("", "invalid.pem")
-	err = ioutil.WriteFile(invalidPEMFile.Name(), []byte(""), 0640)
+	invalidPEMFile, _ := os.CreateTemp("", "invalid.pem")
+	err = os.WriteFile(invalidPEMFile.Name(), []byte(""), 0640)
 	test.AssertNotError(t, err, "Error writing invalid PEM tmp file")
 	_, err = LoadChain([]string{
 		invalidPEMFile.Name(),

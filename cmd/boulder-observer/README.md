@@ -3,31 +3,47 @@
 A modular configuration driven approach to black box monitoring with
 Prometheus.
 
-* [boulder-observer](#boulder-observer)
-  * [Usage](#usage)
-    * [Options](#options)
-    * [Starting the boulder-observer
-      daemon](#starting-the-boulder-observer-daemon)
-  * [Configuration](#configuration)
-    * [Root](#root)
-      * [Schema](#schema)
-      * [Example](#example)
-    * [Monitors](#monitors)
-      * [Schema](#schema-1)
-      * [Example](#example-1)
-    * [Probers](#probers)
-      * [DNS](#dns)
-        * [Schema](#schema-2)
-        * [Example](#example-2)
-      * [HTTP](#http)
-        * [Schema](#schema-3)
-        * [Example](#example-3)
-  * [Metrics](#metrics)
-    * [obs_monitors](#obs_monitors)
-    * [obs_observations](#obs_observations)
-  * [Development](#development)
-    * [Starting Prometheus locally](#starting-prometheus-locally)
-    * [Viewing metrics locally](#viewing-metrics-locally)
+- [boulder-observer](#boulder-observer)
+  - [Usage](#usage)
+    - [Options](#options)
+    - [Starting the boulder-observer daemon](#starting-the-boulder-observer-daemon)
+  - [Configuration](#configuration)
+    - [Root](#root)
+      - [Schema](#schema)
+      - [Example](#example)
+    - [Monitors](#monitors)
+      - [Schema](#schema-1)
+      - [Example](#example-1)
+    - [Probers](#probers)
+      - [DNS](#dns)
+        - [Schema](#schema-2)
+        - [Example](#example-2)
+      - [HTTP](#http)
+        - [Schema](#schema-3)
+        - [Example](#example-3)
+      - [CRL](#crl)
+        - [Schema](#schema-4)
+        - [Example](#example-4)
+      - [TLS](#tls)
+        - [Schema](#schema-5)
+        - [Example](#example-5)
+      - [ACME](#acme)
+        - [Schema](#schema-6)
+        - [Example](#example-6)
+  - [Metrics](#metrics)
+    - [Global Metrics](#global-metrics)
+      - [obs\_monitors](#obs_monitors)
+      - [obs\_observations](#obs_observations)
+    - [CRL Metrics](#crl-metrics)
+      - [obs\_crl\_this\_update](#obs_crl_this_update)
+      - [obs\_crl\_next\_update](#obs_crl_next_update)
+      - [obs\_crl\_revoked\_cert\_count](#obs_crl_revoked_cert_count)
+    - [TLS Metrics](#tls-metrics)
+      - [obs\_tls\_not\_after](#obs_tls_not_after)
+      - [obs\_tls\_reason](#obs_tls_reason)
+  - [Development](#development)
+    - [Starting Prometheus locally](#starting-prometheus-locally)
+    - [Viewing metrics locally](#viewing-metrics-locally)
 
 ## Usage
 
@@ -166,10 +182,53 @@ monitors:
   - 
     period: 2s
     kind: HTTP
-    settings: 
+    settings:
       url: http://letsencrypt.org/FOO
       rcodes: [200, 404]
       useragent: letsencrypt/boulder-observer-http-client
+```
+
+#### CRL
+
+##### Schema
+
+`url`: Scheme + Hostname to grab the CRL from (e.g. `http://x1.c.lencr.org/`).
+
+##### Example
+
+```yaml
+monitors:
+  - 
+    period: 1h
+    kind: CRL
+    settings:
+      url: http://x1.c.lencr.org/
+```
+
+#### TLS
+
+##### Schema
+
+`hostname`: Hostname to run TLS check on (e.g. `valid-isrgrootx1.letsencrypt.org`).
+
+`rootOrg`: Organization to check against the root certificate Organization (e.g. `Internet Security Research Group`).
+
+`rootCN`: Name to check against the root certificate Common Name (e.g. `ISRG Root X1`). If not provided, root comparison will be skipped.
+
+`response`: Expected site response; must be one of: `valid`, `revoked` or `expired`.
+
+##### Example
+
+```yaml
+monitors:
+  - 
+    period: 1h
+    kind: TLS
+    settings:
+      hostname: valid-isrgrootx1.letsencrypt.org
+      rootOrg: "Internet Security Research Group"
+      rootCN: "ISRG Root X1"
+      response: valid
 ```
 
 #### ACME
@@ -209,7 +268,11 @@ monitors:
 
 Observer provides the following metrics.
 
-### obs_monitors
+### Global Metrics
+
+These metrics will always be available.
+
+#### obs_monitors
 
 Count of configured monitors.
 
@@ -220,7 +283,7 @@ Count of configured monitors.
 `valid`: Bool indicating whether settings provided could be validated
 for the `kind` of Prober specified.
 
-### obs_observations
+#### obs_observations
 
 **Labels:**
 
@@ -236,6 +299,111 @@ successful.
 **Bucketed response times:**
 
 This is configurable, see `buckets` under [root/schema](#schema).
+
+### CRL Metrics
+
+These metrics will be available whenever a valid CRL prober is configured.
+
+#### obs_crl_this_update
+
+Unix timestamp value (in seconds) of the thisUpdate field for a CRL.
+
+**Labels:**
+
+`url`: Url of the CRL
+
+**Example Usage:**
+
+This is a sample rule that alerts when a CRL has a thisUpdate timestamp in the future, signalling that something may have gone wrong during its creation:
+
+```yaml
+- alert: CRLThisUpdateInFuture
+  expr: obs_crl_this_update{url="http://x1.c.lencr.org/"} > time()
+  labels:
+    severity: critical
+  annotations:
+    description: 'CRL thisUpdate is in the future'
+```
+
+#### obs_crl_next_update
+
+Unix timestamp value (in seconds) of the nextUpdate field for a CRL.
+
+**Labels:**
+
+`url`: Url of the CRL
+
+**Example Usage:**
+
+This is a sample rule that alerts when a CRL has a nextUpdate timestamp in the past, signalling that the CRL was not updated on time:
+
+```yaml
+- alert: CRLNextUpdateInPast
+  expr: obs_crl_next_update{url="http://x1.c.lencr.org/"} < time()
+  labels:
+    severity: critical
+  annotations:
+    description: 'CRL nextUpdate is in the past'
+```
+
+Another potentially useful rule would be to notify when nextUpdate is within X days from the current time, as a reminder that the update is coming up soon.
+
+#### obs_crl_revoked_cert_count
+
+Count of revoked certificates in a CRL.
+
+**Labels:**
+
+`url`: Url of the CRL
+
+### TLS Metrics
+
+These metrics will be available whenever a valid TLS prober is configured.
+
+#### obs_tls_not_after
+
+Unix timestamp value (in seconds) of the notAfter field for a subscriber certificate.
+
+**Labels:**
+
+`hostname`: Hostname of the site of the subscriber certificate
+
+**Example Usage:**
+
+This is a sample rule that alerts when a site has a notAfter timestamp indicating that the certificate will expire within the next 20 days:
+
+```yaml
+  - alert: CertExpiresSoonWarning
+    annotations:
+      description: "The certificate at {{ $labels.hostname }} expires within 20 days, on: {{ $value | humanizeTimestamp }}"
+    expr: (obs_tls_not_after{hostname=~"^[^e][a-zA-Z]*-isrgrootx[12][.]letsencrypt[.]org"}) <= time() + 1728000
+    for: 60m
+    labels:
+      severity: warning
+```
+
+#### obs_tls_reason
+
+This is a count that increments by one for each resulting reason of a TSL check. The reason is `nil` if the TLS Prober returns `true` and one of the following otherwise: `internalError`, `ocspError`, `rootDidNotMatch`, `responseDidNotMatch`.
+
+**Labels:**
+
+`hostname`: Hostname of the site of the subscriber certificate
+`reason`: The reason for TLS Probe returning false, and `nil` if it returns true
+
+**Example Usage:**
+
+This is a sample rule that alerts when TLS Prober returns false, providing insight on the reason for failure.
+
+```yaml
+  - alert: TLSCertCheckFailed
+    annotations:
+      description: "The TLS probe for {{ $labels.hostname }} failed for reason: {{ $labels.reason }}. This potentially violents CP 2.2."
+    expr: (rate(obs_observations_count{success="false",name=~"[a-zA-Z]*-isrgrootx[12][.]letsencrypt[.]org"}[5m])) > 0
+    for: 5m
+    labels:
+      severity: critical
+```
 
 ## Development
 

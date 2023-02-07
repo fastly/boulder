@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"math/big"
+	"os"
 	"testing"
 	"time"
 
@@ -22,7 +23,35 @@ import (
 	"google.golang.org/grpc"
 )
 
-func makeClient() (*rocsp.WritingClient, clock.Clock) {
+func makeClient() (*rocsp.RWClient, clock.Clock) {
+	CACertFile := "../../test/redis-tls/minica.pem"
+	CertFile := "../../test/redis-tls/boulder/cert.pem"
+	KeyFile := "../../test/redis-tls/boulder/key.pem"
+	tlsConfig := cmd.TLSConfig{
+		CACertFile: &CACertFile,
+		CertFile:   &CertFile,
+		KeyFile:    &KeyFile,
+	}
+	tlsConfig2, err := tlsConfig.Load()
+	if err != nil {
+		panic(err)
+	}
+
+	rdb := redis.NewRing(&redis.RingOptions{
+		Addrs: map[string]string{
+			"shard1": "10.33.33.8:4218",
+			"shard2": "10.33.33.9:4218",
+		},
+		Username:  "unittest-rw",
+		Password:  "824968fa490f4ecec1e52d5e34916bdb60d45f8d",
+		TLSConfig: tlsConfig2,
+	})
+	clk := clock.NewFake()
+	return rocsp.NewWritingClient(rdb, 500*time.Millisecond, clk, metrics.NoopRegisterer), clk
+}
+
+// TODO(#6517) remove this helper.
+func makeClusterClient() (*rocsp.CRWClient, clock.Clock) {
 	CACertFile := "../../test/redis-tls/minica.pem"
 	CertFile := "../../test/redis-tls/boulder/cert.pem"
 	KeyFile := "../../test/redis-tls/boulder/key.pem"
@@ -43,14 +72,15 @@ func makeClient() (*rocsp.WritingClient, clock.Clock) {
 		TLSConfig: tlsConfig2,
 	})
 	clk := clock.NewFake()
-	return rocsp.NewWritingClient(rdb, 500*time.Millisecond, clk, metrics.NoopRegisterer), clk
+
+	return rocsp.NewClusterWritingClient(rdb, 5*time.Second, clk, metrics.NoopRegisterer), clk
 }
 
 func TestGetStartingID(t *testing.T) {
 	clk := clock.NewFake()
 	dbMap, err := sa.NewDbMap(vars.DBConnSAFullPerms, sa.DbSettings{})
 	test.AssertNotError(t, err, "failed setting up db client")
-	defer test.ResetSATestDatabase(t)()
+	defer test.ResetBoulderTestDatabase(t)()
 	sa.SetSQLDebug(dbMap, blog.Get())
 
 	cs := core.CertificateStatus{
@@ -79,7 +109,14 @@ func TestGetStartingID(t *testing.T) {
 }
 
 func TestStoreResponse(t *testing.T) {
-	redisClient, clk := makeClient()
+	// TODO(#6517) remove this block.
+	var redisClient rocsp.Writer
+	var clk clock.Clock
+	if os.Getenv("BOULDER_CONFIG_DIR") == "test/config" {
+		redisClient, clk = makeClusterClient()
+	} else {
+		redisClient, clk = makeClient()
+	}
 
 	issuer, err := core.LoadCert("../../test/hierarchy/int-e1.cert.pem")
 	test.AssertNotError(t, err, "loading int-e1")
@@ -116,14 +153,21 @@ func (mog mockOCSPGenerator) GenerateOCSP(ctx context.Context, in *capb.Generate
 }
 
 func TestLoadFromDB(t *testing.T) {
-	redisClient, clk := makeClient()
+	// TODO(#6517) remove this block.
+	var redisClient rocsp.Writer
+	var clk clock.Clock
+	if os.Getenv("BOULDER_CONFIG_DIR") == "test/config" {
+		redisClient, clk = makeClusterClient()
+	} else {
+		redisClient, clk = makeClient()
+	}
 
 	dbMap, err := sa.NewDbMap(vars.DBConnSA, sa.DbSettings{})
 	if err != nil {
 		t.Fatalf("Failed to create dbMap: %s", err)
 	}
 
-	defer test.ResetSATestDatabase(t)
+	defer test.ResetBoulderTestDatabase(t)
 
 	for i := 0; i < 100; i++ {
 		err = dbMap.Insert(&core.CertificateStatus{

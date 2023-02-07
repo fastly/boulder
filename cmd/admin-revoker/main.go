@@ -9,6 +9,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/user"
 	"sort"
@@ -36,20 +37,21 @@ usage:
   list-reasons           -config <path>
   serial-revoke          -config <path> <serial>           <reason-code>
   batched-serial-revoke  -config <path> <serial-file-path> <reason-code>   <parallelism>
+  incident-table-revoke  -config <path> <table-name>       <reason-code>   <parallelism>
   reg-revoke             -config <path> <registration-id>  <reason-code>
-  private-key-block      -config <path> -dry-run=<bool>    <priv-key-path>
-  private-key-revoke     -config <path> -dry-run=<bool>    <priv-key-path>
+  private-key-block      -config <path> -comment="<string>" -dry-run=<bool>    <priv-key-path>
+  private-key-revoke     -config <path> -comment="<string>" -dry-run=<bool>    <priv-key-path>
 
 
 descriptions:
   list-reasons           List all revocation reason codes
   serial-revoke          Revoke a single certificate by the hex serial number
   batched-serial-revoke  Revokes all certificates contained in a file of hex serial numbers
+  incident-table-revoke  Revokes all certificates in the provided incident table
   reg-revoke             Revoke all certificates associated with a registration ID
   private-key-block      Adds the SPKI hash, derived from the provided private key, to the
                          blocked keys table. <priv-key-path> is expected to be the path
                          to a PEM formatted file containing an RSA or ECDSA private key
-
   private-key-revoke     Revokes all certificates matching the SPKI hash derived from the
                          provided private key. Then adds the hash to the blocked keys
                          table. <priv-key-path> is expected to be the path to a PEM
@@ -63,6 +65,7 @@ flags:
     -dry-run             true (default): only queries for affected certificates. false: will
                          perform the requested block or revoke action. Only implemented for
                          private-key-block and private-key-revoke.
+    -comment             Comment to include in the blocked keys table entry. (default: "")
 `
 
 type Config struct {
@@ -98,15 +101,14 @@ func newRevoker(c Config) *revoker {
 
 	clk := cmd.Clock()
 
-	clientMetrics := bgrpc.NewClientMetrics(metrics.NoopRegisterer)
-	raConn, err := bgrpc.ClientSetup(c.Revoker.RAService, tlsConfig, clientMetrics, clk)
+	raConn, err := bgrpc.ClientSetup(c.Revoker.RAService, tlsConfig, metrics.NoopRegisterer, clk)
 	cmd.FailOnError(err, "Failed to load credentials and create gRPC connection to RA")
 	rac := rapb.NewRegistrationAuthorityClient(raConn)
 
 	dbMap, err := sa.InitWrappedDb(c.Revoker.DB, nil, logger)
 	cmd.FailOnError(err, "While initializing dbMap")
 
-	saConn, err := bgrpc.ClientSetup(c.Revoker.SAService, tlsConfig, clientMetrics, clk)
+	saConn, err := bgrpc.ClientSetup(c.Revoker.SAService, tlsConfig, metrics.NoopRegisterer, clk)
 	cmd.FailOnError(err, "Failed to load credentials and create gRPC connection to SA")
 	sac := sapb.NewStorageAuthorityClient(saConn)
 
@@ -167,7 +169,7 @@ func (r *revoker) revokeBySerial(ctx context.Context, serial string, reasonCode 
 	return r.revokeCertificate(ctx, certObj, reasonCode, skipBlockKey)
 }
 
-func (r *revoker) revokeBySerialBatch(ctx context.Context, serialPath string, reasonCode revocation.Reason, parallelism int) error {
+func (r *revoker) revokeSerialBatchFile(ctx context.Context, serialPath string, reasonCode revocation.Reason, parallelism int) error {
 	file, err := os.Open(serialPath)
 	if err != nil {
 		return err
@@ -210,6 +212,48 @@ func (r *revoker) revokeBySerialBatch(ctx context.Context, serialPath string, re
 	return nil
 }
 
+func (r *revoker) revokeIncidentTableSerials(ctx context.Context, tableName string, reasonCode revocation.Reason, parallelism int) error {
+	wg := new(sync.WaitGroup)
+	work := make(chan string, parallelism)
+	for i := 0; i < parallelism; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for serial := range work {
+				err := r.revokeBySerial(ctx, serial, reasonCode, false)
+				if err != nil {
+					r.log.Errf("failed to revoke %q: %s", serial, err)
+				}
+			}
+		}()
+	}
+
+	stream, err := r.sac.SerialsForIncident(ctx, &sapb.SerialsForIncidentRequest{IncidentTable: tableName})
+	if err != nil {
+		return fmt.Errorf("setting up stream of serials from incident table %q: %s", tableName, err)
+	}
+
+	var atLeastOne bool
+	for {
+		is, err := stream.Recv()
+		if err != nil {
+			if err == io.EOF {
+				break
+			}
+			return fmt.Errorf("streaming serials from incident table %q: %s", tableName, err)
+		}
+		atLeastOne = true
+		work <- is.Serial
+	}
+	if !atLeastOne {
+		r.log.AuditInfof("No serials found in incident table %q", tableName)
+	}
+	close(work)
+	wg.Wait()
+
+	return nil
+}
+
 func (r *revoker) revokeByReg(ctx context.Context, regID int64, reasonCode revocation.Reason) error {
 	_, err := r.sac.GetRegistration(ctx, &sapb.RegistrationID{Id: regID})
 	if err != nil {
@@ -240,7 +284,7 @@ func (r *revoker) revokeMalformedBySerial(ctx context.Context, serial string, re
 // not revoke any certificates directly. However, 'bad-key-revoker', which
 // references the 'blockedKeys' table, will eventually revoke certificates with
 // a matching SPKI hash.
-func (r *revoker) blockByPrivateKey(ctx context.Context, privateKey string) error {
+func (r *revoker) blockByPrivateKey(ctx context.Context, comment string, privateKey string) error {
 	_, publicKey, err := privatekey.Load(privateKey)
 	if err != nil {
 		return err
@@ -256,11 +300,13 @@ func (r *revoker) blockByPrivateKey(ctx context.Context, privateKey string) erro
 		return err
 	}
 
+	dbcomment := fmt.Sprintf("%s: %s", u.Username, comment)
+
 	req := &sapb.AddBlockedKeyRequest{
 		KeyHash:   spkiHash,
 		Added:     r.clk.Now().UnixNano(),
 		Source:    "admin-revoker",
-		Comment:   fmt.Sprintf("blocked by %s", u),
+		Comment:   dbcomment,
 		RevokedBy: 0,
 	}
 
@@ -368,7 +414,7 @@ func (rc revocationCodes) Len() int           { return len(rc) }
 func (rc revocationCodes) Less(i, j int) bool { return rc[i] < rc[j] }
 func (rc revocationCodes) Swap(i, j int)      { rc[i], rc[j] = rc[j], rc[i] }
 
-func privateKeyBlock(r *revoker, dryRun bool, count int, spkiHash []byte, keyPath string) error {
+func privateKeyBlock(r *revoker, dryRun bool, comment string, count int, spkiHash []byte, keyPath string) error {
 	keyExists, err := r.spkiHashInBlockedKeys(spkiHash)
 	if err != nil {
 		return fmt.Errorf("while checking if the provided key already exists in the 'blockedKeys' table: %s", err)
@@ -387,7 +433,7 @@ func privateKeyBlock(r *revoker, dryRun bool, count int, spkiHash []byte, keyPat
 	}
 
 	r.log.AuditInfo("Attempting to block issuance for the provided key")
-	err = r.blockByPrivateKey(context.Background(), keyPath)
+	err = r.blockByPrivateKey(context.Background(), comment, keyPath)
 	if err != nil {
 		return fmt.Errorf("while attempting to block issuance for the provided key: %s", err)
 	}
@@ -395,7 +441,7 @@ func privateKeyBlock(r *revoker, dryRun bool, count int, spkiHash []byte, keyPat
 	return nil
 }
 
-func privateKeyRevoke(r *revoker, dryRun bool, count int, keyPath string) error {
+func privateKeyRevoke(r *revoker, dryRun bool, comment string, count int, keyPath string) error {
 	if dryRun {
 		r.log.AuditInfof(
 			"To immediately revoke %d certificates and block issuance for this key, run with -dry-run=false",
@@ -420,7 +466,7 @@ func privateKeyRevoke(r *revoker, dryRun bool, count int, keyPath string) error 
 
 	// Block future issuance.
 	r.log.AuditInfo("Attempting to block issuance for the provided key")
-	err = r.blockByPrivateKey(context.Background(), keyPath)
+	err = r.blockByPrivateKey(context.Background(), comment, keyPath)
 	if err != nil {
 		return fmt.Errorf("while attempting to block issuance for the provided key: %s", err)
 	}
@@ -456,6 +502,7 @@ func main() {
 		true,
 		"true (default): only queries for affected certificates. false: will perform the requested block or revoke action",
 	)
+	comment := flagSet.String("comment", "", "Comment to include in the blocked key database entry ")
 	err := flagSet.Parse(os.Args[2:])
 	cmd.FailOnError(err, "Error parsing flagset")
 
@@ -495,7 +542,7 @@ func main() {
 			cmd.Fail("parallelism argument must be >= 1")
 		}
 
-		err = r.revokeBySerialBatch(ctx, serialPath, revocation.Reason(reasonCode), parallelism)
+		err = r.revokeSerialBatchFile(ctx, serialPath, revocation.Reason(reasonCode), parallelism)
 		cmd.FailOnError(err, "Batch revocation failed")
 
 	case command == "reg-revoke" && len(args) == 2:
@@ -544,14 +591,28 @@ func main() {
 		r.log.AuditInfof("Found %d certificates matching the provided key", count)
 
 		if command == "private-key-block" {
-			err := privateKeyBlock(r, *dryRun, count, spkiHash, keyPath)
+			err := privateKeyBlock(r, *dryRun, *comment, count, spkiHash, keyPath)
 			cmd.FailOnError(err, "")
 		}
 
 		if command == "private-key-revoke" {
-			err := privateKeyRevoke(r, *dryRun, count, keyPath)
+			err := privateKeyRevoke(r, *dryRun, *comment, count, keyPath)
 			cmd.FailOnError(err, "")
 		}
+
+	case command == "incident-table-revoke" && len(args) == 3:
+		// 1: tableName, 2: reasonCode, 3: parallelism
+		tableName := args[0]
+
+		reasonCode, err := strconv.Atoi(args[1])
+		cmd.FailOnError(err, "Reason code argument must be an integer")
+
+		parallelism, err := strconv.Atoi(args[2])
+		cmd.FailOnError(err, "parallelism argument must be an integer")
+		if parallelism < 1 {
+			cmd.Fail("parallelism argument must be >= 1")
+		}
+		r.revokeIncidentTableSerials(ctx, tableName, revocation.Reason(reasonCode), parallelism)
 
 	default:
 		usage()

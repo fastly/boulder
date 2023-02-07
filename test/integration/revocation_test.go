@@ -9,7 +9,7 @@ import (
 	"crypto/rand"
 	"crypto/x509"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"os"
 	"strings"
@@ -40,177 +40,8 @@ func isPrecert(cert *x509.Certificate) bool {
 func TestRevocation(t *testing.T) {
 	t.Parallel()
 
-	// This test is gated on lacking the MozRevocationReasons feature flag.
-	if strings.Contains(os.Getenv("BOULDER_CONFIG_DIR"), "test/config-next") {
-		return
-	}
-
 	// Create a base account to use for revocation tests.
-	os.Setenv("DIRECTORY", "http://boulder:4001/directory")
-
-	type authMethod string
-	var (
-		byAccount authMethod = "byAccount"
-		byAuth    authMethod = "byAuth"
-		byKey     authMethod = "byKey"
-	)
-
-	type certKind string
-	var (
-		finalcert certKind = "cert"
-		precert   certKind = "precert"
-	)
-
-	type testCase struct {
-		method      authMethod
-		reason      int
-		kind        certKind
-		expectError bool
-	}
-
-	var testCases []testCase
-	for _, kind := range []certKind{precert, finalcert} {
-		for _, reason := range []int{ocsp.Unspecified, ocsp.KeyCompromise} {
-			for _, method := range []authMethod{byAccount, byAuth, byKey} {
-				testCases = append(testCases, testCase{
-					method: method,
-					reason: reason,
-					kind:   kind,
-					// We expect an error only for KeyCompromise requests that use auth
-					// methods other than using the certificate key itself.
-					expectError: (reason == ocsp.KeyCompromise) && (method != byKey),
-				})
-			}
-		}
-	}
-
-	for _, tc := range testCases {
-		name := fmt.Sprintf("%s_%d_%s", tc.kind, tc.reason, tc.method)
-		t.Run(name, func(t *testing.T) {
-			issueClient, err := makeClient()
-			test.AssertNotError(t, err, "creating acme client")
-
-			certKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-			test.AssertNotError(t, err, "creating random cert key")
-
-			domain := random_domain()
-
-			// Try to issue a certificate for the name.
-			var cert *x509.Certificate
-			switch tc.kind {
-			case finalcert:
-				res, err := authAndIssue(issueClient, certKey, []string{domain})
-				test.AssertNotError(t, err, "authAndIssue failed")
-				cert = res.certs[0]
-
-			case precert:
-				// Make sure the ct-test-srv will reject generating SCTs for the domain,
-				// so we only get a precert and no final cert.
-				err := ctAddRejectHost(domain)
-				test.AssertNotError(t, err, "adding ct-test-srv reject host")
-
-				_, err = authAndIssue(issueClient, certKey, []string{domain})
-				test.AssertError(t, err, "expected error from authAndIssue, was nil")
-				if !strings.Contains(err.Error(), "urn:ietf:params:acme:error:serverInternal") ||
-					!strings.Contains(err.Error(), "SCT embedding") {
-					t.Fatal(err)
-				}
-
-				// Instead recover the precertificate from CT.
-				cert, err = ctFindRejection([]string{domain})
-				if err != nil || cert == nil {
-					t.Fatalf("couldn't find rejected precert for %q", domain)
-				}
-				// And make sure the cert we found is in fact a precert.
-				if !isPrecert(cert) {
-					t.Fatal("precert was missing poison extension")
-				}
-
-			default:
-				t.Fatalf("unrecognized cert kind %q", tc.kind)
-			}
-
-			// Initially, the cert should have a Good OCSP response.
-			ocspConfig := ocsp_helper.DefaultConfig.WithExpectStatus(ocsp.Good)
-			_, err = ocsp_helper.ReqDER(cert.Raw, ocspConfig)
-			test.AssertNotError(t, err, "requesting OCSP for precert")
-
-			// Set up the account and key that we'll use to try to revoke the cert.
-			var revokeClient *client
-			var revokeKey crypto.Signer
-			switch tc.method {
-			case byAccount:
-				// When revoking by account, use the same client and key as were used
-				// for the original issuance.
-				revokeClient = issueClient
-				revokeKey = revokeClient.PrivateKey
-
-			case byAuth:
-				// When revoking by auth, create a brand new client, authorize it for
-				// the same domain, and use that account and key for revocation. Ignore
-				// errors from authAndIssue because all we need is the auth, not the
-				// issuance.
-				revokeClient, err = makeClient()
-				test.AssertNotError(t, err, "creating second acme client")
-				_, _ = authAndIssue(revokeClient, certKey, []string{domain})
-				revokeKey = revokeClient.PrivateKey
-
-			case byKey:
-				// When revoking by key, create a branch new client and use it and
-				// the cert's key for revocation.
-				revokeClient, err = makeClient()
-				test.AssertNotError(t, err, "creating second acme client")
-				revokeKey = certKey
-
-			default:
-				t.Fatalf("unrecognized revocation method %q", tc.method)
-			}
-
-			// Revoke the cert using the specified key and client.
-			err = revokeClient.RevokeCertificate(
-				revokeClient.Account,
-				cert,
-				revokeKey,
-				tc.reason,
-			)
-
-			switch tc.expectError {
-			case false:
-				test.AssertNotError(t, err, "revocation should have succeeded")
-
-				// Check the OCSP response for the certificate again. It should now be
-				// revoked.
-				ocspConfig = ocsp_helper.DefaultConfig.WithExpectStatus(ocsp.Revoked)
-				_, err = ocsp_helper.ReqDER(cert.Raw, ocspConfig)
-				test.AssertNotError(t, err, "requesting OCSP for revoked cert")
-
-			case true:
-				test.AssertError(t, err, "revocation should have failed")
-
-				// Check the OCSP response for the certificate again. It should still
-				// be good.
-				ocspConfig = ocsp_helper.DefaultConfig.WithExpectStatus(ocsp.Good)
-				_, err = ocsp_helper.ReqDER(cert.Raw, ocspConfig)
-				test.AssertNotError(t, err, "requesting OCSP for nonrevoked cert")
-			}
-		})
-	}
-}
-
-// TestMozRevocation tests that a certificate can be revoked using all of the
-// RFC 8555 revocation authentication mechanisms. It does so for both certs and
-// precerts (with no corresponding final cert), and for both the Unspecified and
-// keyCompromise revocation reasons.
-func TestMozRevocation(t *testing.T) {
-	t.Parallel()
-
-	// This test is gated on the MozRevocationReasons feature flag.
-	if !strings.Contains(os.Getenv("BOULDER_CONFIG_DIR"), "test/config-next") {
-		return
-	}
-
-	// Create a base account to use for revocation tests.
-	os.Setenv("DIRECTORY", "http://boulder:4001/directory")
+	os.Setenv("DIRECTORY", "http://boulder.service.consul:4001/directory")
 
 	type authMethod string
 	var (
@@ -363,73 +194,17 @@ func TestMozRevocation(t *testing.T) {
 	}
 }
 
-// TestDoubleRevocationOff verifies that a certificate cannot have its
-// revocation reason updated (after the first time it has been revoked)
-// for any reason.
-func TestDoubleRevocationOff(t *testing.T) {
-	t.Parallel()
-
-	// This test is gated on lacking the AllowReRevocation feature flag.
-	if strings.Contains(os.Getenv("BOULDER_CONFIG_DIR"), "test/config-next") {
-		return
-	}
-
-	// Create a base account to use for revocation tests.
-	os.Setenv("DIRECTORY", "http://boulder:4001/directory")
-
-	client, err := makeClient()
-	test.AssertNotError(t, err, "creating acme client")
-
-	certKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	test.AssertNotError(t, err, "creating random cert key")
-
-	domain := random_domain()
-
-	res, err := authAndIssue(client, certKey, []string{domain})
-	test.AssertNotError(t, err, "authAndIssue failed")
-	cert := res.certs[0]
-
-	ocspConfig := ocsp_helper.DefaultConfig.WithExpectStatus(ocsp.Good)
-	_, err = ocsp_helper.ReqDER(cert.Raw, ocspConfig)
-	test.AssertNotError(t, err, "requesting OCSP for cert")
-
-	// Have the original subscriber revoke the cert for any reason.
-	err = client.RevokeCertificate(client.Account, cert, client.PrivateKey, 0)
-	test.AssertNotError(t, err, "revocation should have succeeded")
-
-	// Re-revoking for the same reason should fail.
-	err = client.RevokeCertificate(client.Account, cert, client.PrivateKey, 0)
-	test.AssertError(t, err, "re-revocation should have failed")
-
-	// Re-revoking for a different reason should fail.
-	err = client.RevokeCertificate(client.Account, cert, client.PrivateKey, 3)
-	test.AssertError(t, err, "re-revocation should have failed")
-
-	// Re-revoking for keyCompromise should fail.
-	err = client.RevokeCertificate(client.Account, cert, client.PrivateKey, 1)
-	test.AssertError(t, err, "re-revocation should have failed")
-
-	// Re-revoking for keyCompromise using the cert key should fail.
-	err = client.RevokeCertificate(client.Account, cert, certKey, 1)
-	test.AssertError(t, err, "re-revocation should have failed")
-}
-
-// TestDoubleRevocationOn verifies that a certificate can have its revocation
+// TestReRevocation verifies that a certificate can have its revocation
 // information updated only when both of the following are true:
 // a) The certificate was not initially revoked for reason keyCompromise; and
 // b) The second request is authenticated using the cert's keypair.
 // In which case the revocation reason (but not revocation date) will be
 // updated to be keyCompromise.
-func TestDoubleRevocationOn(t *testing.T) {
+func TestReRevocation(t *testing.T) {
 	t.Parallel()
 
-	// This test is gated on the AllowReRevocation feature flag.
-	if !strings.Contains(os.Getenv("BOULDER_CONFIG_DIR"), "test/config-next") {
-		return
-	}
-
 	// Create a base account to use for revocation tests.
-	os.Setenv("DIRECTORY", "http://boulder:4001/directory")
+	os.Setenv("DIRECTORY", "http://boulder.service.consul:4001/directory")
 
 	type authMethod string
 	var (
@@ -560,7 +335,7 @@ func TestDoubleRevocationOn(t *testing.T) {
 
 func TestRevokeWithKeyCompromiseBlocksKey(t *testing.T) {
 	t.Parallel()
-	os.Setenv("DIRECTORY", "http://boulder:4001/directory")
+	os.Setenv("DIRECTORY", "http://boulder.service.consul:4001/directory")
 
 	type authMethod string
 	var (
@@ -568,16 +343,10 @@ func TestRevokeWithKeyCompromiseBlocksKey(t *testing.T) {
 		byKey     authMethod = "byKey"
 	)
 
-	// If the MozRevocationReasons flag is *not* set, only run this test with the
-	// byKey authorization method, because revoking for reason Key Compromise via
-	// any other method is forbidden. If the MozRevocationReasons flag *is* set,
-	// test both byKey and byAccount, but expect slightly different results.
-	methods := []authMethod{byKey}
-	if strings.Contains(os.Getenv("BOULDER_CONFIG_DIR"), "test/config-next") {
-		methods = append(methods, byAccount)
-	}
-
-	for _, method := range methods {
+	// Test keyCompromise revocation both when revoking by certificate key and
+	// revoking by subscriber key. Both should work, although with slightly
+	// different behavior.
+	for _, method := range []authMethod{byKey, byAccount} {
 		c, err := makeClient("mailto:example@letsencrypt.org")
 		test.AssertNotError(t, err, "creating acme client")
 
@@ -618,7 +387,7 @@ func TestRevokeWithKeyCompromiseBlocksKey(t *testing.T) {
 }
 
 func TestBadKeyRevoker(t *testing.T) {
-	os.Setenv("DIRECTORY", "http://boulder:4001/directory")
+	os.Setenv("DIRECTORY", "http://boulder.service.consul:4001/directory")
 
 	// Both accounts have two email addresses, one of which is shared between
 	// them. All three addresses should receive mail, because the revocation
@@ -676,37 +445,30 @@ func TestBadKeyRevoker(t *testing.T) {
 		}
 	}
 
-	revokeeCount, err := http.Get("http://boulder:9381/count?to=revokee@letsencrypt.org&from=bad-key-revoker@test.org")
+	revokeeCount, err := http.Get("http://boulder.service.consul:9381/count?to=revokee@letsencrypt.org&from=bad-key-revoker@test.org")
 	test.AssertNotError(t, err, "mail-test-srv GET /count failed")
 	defer func() { _ = revokeeCount.Body.Close() }()
-	body, err := ioutil.ReadAll(revokeeCount.Body)
+	body, err := io.ReadAll(revokeeCount.Body)
 	test.AssertNotError(t, err, "failed to read body")
 	test.AssertEquals(t, string(body), "1\n")
 
-	revokerCount, err := http.Get("http://boulder:9381/count?to=revoker@letsencrypt.org&from=bad-key-revoker@test.org")
+	revokerCount, err := http.Get("http://boulder.service.consul:9381/count?to=revoker@letsencrypt.org&from=bad-key-revoker@test.org")
 	test.AssertNotError(t, err, "mail-test-srv GET /count failed")
 	defer func() { _ = revokerCount.Body.Close() }()
-	body, err = ioutil.ReadAll(revokerCount.Body)
+	body, err = io.ReadAll(revokerCount.Body)
 	test.AssertNotError(t, err, "failed to read body")
 	test.AssertEquals(t, string(body), "1\n")
 
-	sharedCount, err := http.Get("http://boulder:9381/count?to=shared@letsencrypt.org&from=bad-key-revoker@test.org")
+	sharedCount, err := http.Get("http://boulder.service.consul:9381/count?to=shared@letsencrypt.org&from=bad-key-revoker@test.org")
 	test.AssertNotError(t, err, "mail-test-srv GET /count failed")
 	defer func() { _ = sharedCount.Body.Close() }()
-	body, err = ioutil.ReadAll(sharedCount.Body)
+	body, err = io.ReadAll(sharedCount.Body)
 	test.AssertNotError(t, err, "failed to read body")
 	test.AssertEquals(t, string(body), "1\n")
 }
 
 func TestBadKeyRevokerByAccount(t *testing.T) {
-	os.Setenv("DIRECTORY", "http://boulder:4001/directory")
-
-	// This test is gated on the MozRevocationReasons feature flag being set.
-	// It does not replace the test above, it complements it by testing new
-	// behavior enabled by this flag.
-	if !strings.Contains(os.Getenv("BOULDER_CONFIG_DIR"), "test/config-next") {
-		return
-	}
+	os.Setenv("DIRECTORY", "http://boulder.service.consul:4001/directory")
 
 	// Both accounts have two email addresses, one of which is shared between
 	// them. No accounts should receive any mail, because the revocation request
@@ -764,24 +526,24 @@ func TestBadKeyRevokerByAccount(t *testing.T) {
 		}
 	}
 
-	revokeeCount, err := http.Get("http://boulder:9381/count?to=revokee-moz@letsencrypt.org&from=bad-key-revoker@test.org")
+	revokeeCount, err := http.Get("http://boulder.service.consul:9381/count?to=revokee-moz@letsencrypt.org&from=bad-key-revoker@test.org")
 	test.AssertNotError(t, err, "mail-test-srv GET /count failed")
 	defer func() { _ = revokeeCount.Body.Close() }()
-	body, err := ioutil.ReadAll(revokeeCount.Body)
+	body, err := io.ReadAll(revokeeCount.Body)
 	test.AssertNotError(t, err, "failed to read body")
 	test.AssertEquals(t, string(body), "0\n")
 
-	revokerCount, err := http.Get("http://boulder:9381/count?to=revoker-moz@letsencrypt.org&from=bad-key-revoker@test.org")
+	revokerCount, err := http.Get("http://boulder.service.consul:9381/count?to=revoker-moz@letsencrypt.org&from=bad-key-revoker@test.org")
 	test.AssertNotError(t, err, "mail-test-srv GET /count failed")
 	defer func() { _ = revokerCount.Body.Close() }()
-	body, err = ioutil.ReadAll(revokerCount.Body)
+	body, err = io.ReadAll(revokerCount.Body)
 	test.AssertNotError(t, err, "failed to read body")
 	test.AssertEquals(t, string(body), "0\n")
 
-	sharedCount, err := http.Get("http://boulder:9381/count?to=shared-moz@letsencrypt.org&from=bad-key-revoker@test.org")
+	sharedCount, err := http.Get("http://boulder.service.consul:9381/count?to=shared-moz@letsencrypt.org&from=bad-key-revoker@test.org")
 	test.AssertNotError(t, err, "mail-test-srv GET /count failed")
 	defer func() { _ = sharedCount.Body.Close() }()
-	body, err = ioutil.ReadAll(sharedCount.Body)
+	body, err = io.ReadAll(sharedCount.Body)
 	test.AssertNotError(t, err, "failed to read body")
 	test.AssertEquals(t, string(body), "0\n")
 }

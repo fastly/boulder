@@ -50,7 +50,7 @@ func insertBlockedRow(t *testing.T, dbMap *db.WrappedMap, fc clock.Clock, hash [
 func TestSelectUncheckedRows(t *testing.T) {
 	dbMap, err := sa.NewDbMap(vars.DBConnSAFullPerms, sa.DbSettings{})
 	test.AssertNotError(t, err, "failed setting up db client")
-	defer test.ResetSATestDatabase(t)()
+	defer test.ResetBoulderTestDatabase(t)()
 
 	fc := clock.NewFake()
 
@@ -131,7 +131,9 @@ func insertCert(t *testing.T, dbMap *db.WrappedMap, fc clock.Clock, keyHash []by
 	}
 
 	_, err := dbMap.Exec(
-		"INSERT INTO keyHashToSerial (keyHash, certNotAfter, certSerial) VALUES (?, ?, ?)",
+		`INSERT IGNORE INTO keyHashToSerial
+	     (keyHash, certNotAfter, certSerial) VALUES
+		 (?, ?, ?)`,
 		keyHash,
 		fc.Now().Add(expiresOffset),
 		serial,
@@ -178,7 +180,7 @@ func insertCert(t *testing.T, dbMap *db.WrappedMap, fc clock.Clock, keyHash []by
 func TestFindUnrevokedNoRows(t *testing.T) {
 	dbMap, err := sa.NewDbMap(vars.DBConnSAFullPerms, sa.DbSettings{})
 	test.AssertNotError(t, err, "failed setting up db client")
-	defer test.ResetSATestDatabase(t)()
+	defer test.ResetBoulderTestDatabase(t)()
 
 	fc := clock.NewFake()
 
@@ -199,7 +201,7 @@ func TestFindUnrevokedNoRows(t *testing.T) {
 func TestFindUnrevoked(t *testing.T) {
 	dbMap, err := sa.NewDbMap(vars.DBConnSAFullPerms, sa.DbSettings{})
 	test.AssertNotError(t, err, "failed setting up db client")
-	defer test.ResetSATestDatabase(t)()
+	defer test.ResetBoulderTestDatabase(t)()
 
 	fc := clock.NewFake()
 
@@ -209,6 +211,8 @@ func TestFindUnrevoked(t *testing.T) {
 
 	hashA := randHash(t)
 	// insert valid, unexpired
+	insertCert(t, dbMap, fc, hashA, "ff", regID, Unexpired, Unrevoked)
+	// insert valid, unexpired, duplicate
 	insertCert(t, dbMap, fc, hashA, "ff", regID, Unexpired, Unrevoked)
 	// insert valid, expired
 	insertCert(t, dbMap, fc, hashA, "ee", regID, Expired, Unrevoked)
@@ -231,7 +235,7 @@ func TestFindUnrevoked(t *testing.T) {
 func TestResolveContacts(t *testing.T) {
 	dbMap, err := sa.NewDbMap(vars.DBConnSAFullPerms, sa.DbSettings{})
 	test.AssertNotError(t, err, "failed setting up db client")
-	defer test.ResetSATestDatabase(t)()
+	defer test.ResetBoulderTestDatabase(t)()
 
 	fc := clock.NewFake()
 
@@ -284,7 +288,7 @@ func (mr *mockRevoker) AdministrativelyRevokeCertificate(ctx context.Context, in
 func TestRevokeCerts(t *testing.T) {
 	dbMap, err := sa.NewDbMap(vars.DBConnSAFullPerms, sa.DbSettings{})
 	test.AssertNotError(t, err, "failed setting up db client")
-	defer test.ResetSATestDatabase(t)()
+	defer test.ResetBoulderTestDatabase(t)()
 
 	fc := clock.NewFake()
 	mm := &mocks.Mailer{}
@@ -306,7 +310,7 @@ func TestRevokeCerts(t *testing.T) {
 func TestCertificateAbsent(t *testing.T) {
 	dbMap, err := sa.NewDbMap(vars.DBConnSAFullPerms, sa.DbSettings{})
 	test.AssertNotError(t, err, "failed setting up db client")
-	defer test.ResetSATestDatabase(t)()
+	defer test.ResetBoulderTestDatabase(t)()
 
 	fc := clock.NewFake()
 
@@ -343,7 +347,7 @@ func TestCertificateAbsent(t *testing.T) {
 func TestInvoke(t *testing.T) {
 	dbMap, err := sa.NewDbMap(vars.DBConnSAFullPerms, sa.DbSettings{})
 	test.AssertNotError(t, err, "failed setting up db client")
-	defer test.ResetSATestDatabase(t)()
+	defer test.ResetBoulderTestDatabase(t)()
 
 	fc := clock.NewFake()
 
@@ -415,7 +419,7 @@ func TestInvokeRevokerHasNoExtantCerts(t *testing.T) {
 	// share the same email.
 	dbMap, err := sa.NewDbMap(vars.DBConnSAFullPerms, sa.DbSettings{})
 	test.AssertNotError(t, err, "failed setting up db client")
-	defer test.ResetSATestDatabase(t)()
+	defer test.ResetBoulderTestDatabase(t)()
 
 	fc := clock.NewFake()
 

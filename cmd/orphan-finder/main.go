@@ -9,7 +9,6 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"regexp"
 	"strconv"
@@ -154,7 +153,7 @@ func checkDER(sai sapb.StorageAuthorityCertificateClient, der []byte) (*x509.Cer
 	return nil, orphanTyp, fmt.Errorf("Existing %s lookup failed: %s", orphanTyp, err)
 }
 
-func parseLogLine(line string, logger blog.Logger) (parsedLine, error) {
+func parseLogLine(line string) (parsedLine, error) {
 	derStr := derOrphan.FindStringSubmatch(line)
 	if len(derStr) <= 1 {
 		return parsedLine{}, fmt.Errorf("unable to find cert der: %s", line)
@@ -198,7 +197,7 @@ type orphanFinder struct {
 }
 
 func newOrphanFinder(configFile string) *orphanFinder {
-	configJSON, err := ioutil.ReadFile(configFile)
+	configJSON, err := os.ReadFile(configFile)
 	cmd.FailOnError(err, "Failed to read config file")
 	var conf Config
 	err = json.Unmarshal(configJSON, &conf)
@@ -210,12 +209,11 @@ func newOrphanFinder(configFile string) *orphanFinder {
 	tlsConfig, err := conf.TLS.Load()
 	cmd.FailOnError(err, "TLS config")
 
-	clientMetrics := bgrpc.NewClientMetrics(metrics.NoopRegisterer)
-	saConn, err := bgrpc.ClientSetup(conf.SAService, tlsConfig, clientMetrics, cmd.Clock())
+	saConn, err := bgrpc.ClientSetup(conf.SAService, tlsConfig, metrics.NoopRegisterer, cmd.Clock())
 	cmd.FailOnError(err, "Failed to load credentials and create gRPC connection to SA")
 	sac := sapb.NewStorageAuthorityClient(saConn)
 
-	caConn, err := bgrpc.ClientSetup(conf.OCSPGeneratorService, tlsConfig, clientMetrics, cmd.Clock())
+	caConn, err := bgrpc.ClientSetup(conf.OCSPGeneratorService, tlsConfig, metrics.NoopRegisterer, cmd.Clock())
 	cmd.FailOnError(err, "Failed to load credentials and create gRPC connection to CA")
 	cac := capb.NewOCSPGeneratorClient(caConn)
 
@@ -240,7 +238,7 @@ func newOrphanFinder(configFile string) *orphanFinder {
 // found, and how many it successfully stored.
 func (opf *orphanFinder) parseCALog(logPath string) {
 	ctx := context.Background()
-	logData, err := ioutil.ReadFile(logPath)
+	logData, err := os.ReadFile(logPath)
 	cmd.FailOnError(err, "Failed to read log file")
 
 	var certOrphansFound, certOrphansAdded, precertOrphansFound, precertOrphansAdded int64
@@ -287,7 +285,7 @@ func (opf *orphanFinder) storeLogLine(ctx context.Context, line string) (found b
 		return false, false, unknownOrphan
 	}
 
-	parsed, err := parseLogLine(line, opf.logger)
+	parsed, err := parseLogLine(line)
 	if err != nil {
 		opf.logger.AuditErr(fmt.Sprintf("Couldn't parse log line: %s", err))
 		return true, false, unknownOrphan
@@ -347,7 +345,7 @@ func (opf *orphanFinder) storeLogLine(ctx context.Context, line string) (found b
 // parseDER loads and attempts to store a single orphan from a single DER file.
 func (opf *orphanFinder) parseDER(derPath string, regID int64) {
 	ctx := context.Background()
-	der, err := ioutil.ReadFile(derPath)
+	der, err := os.ReadFile(derPath)
 	cmd.FailOnError(err, "Failed to read DER file")
 	cert, typ, err := checkDER(opf.sa, der)
 	cmd.FailOnError(err, "Pre-AddCertificate checks failed")
@@ -380,6 +378,9 @@ func (opf *orphanFinder) parseDER(derPath string, regID int64) {
 
 // generateOCSP asks the CA to generate a new OCSP response for the given cert.
 func (opf *orphanFinder) generateOCSP(ctx context.Context, cert *x509.Certificate) ([]byte, error) {
+	if features.Enabled(features.ROCSPStage7) {
+		return nil, nil
+	}
 	issuerID := issuance.GetIssuerNameID(cert)
 	_, ok := opf.issuers[issuerID]
 	if !ok {

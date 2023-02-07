@@ -6,7 +6,6 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"strings"
 	"time"
@@ -73,7 +72,7 @@ func lineValid(text string) error {
 }
 
 func validateFile(filename string) error {
-	file, err := ioutil.ReadFile(filename)
+	file, err := os.ReadFile(filename)
 	if err != nil {
 		return err
 	}
@@ -147,7 +146,7 @@ func main() {
 		return
 	}
 
-	configBytes, err := ioutil.ReadFile(*configPath)
+	configBytes, err := os.ReadFile(*configPath)
 	cmd.FailOnError(err, "failed to read config file")
 	var config Config
 	err = json.Unmarshal(configBytes, &config)
@@ -183,7 +182,7 @@ func main() {
 		go func() {
 			for line := range t.Lines {
 				if line.Err != nil {
-					logger.Errf("error while tailing %s: %s", t.Filename, err)
+					logger.Errf("error while tailing %s: %s", t.Filename, line.Err)
 					continue
 				}
 				err := lineValid(line.Text)

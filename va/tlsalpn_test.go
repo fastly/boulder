@@ -59,7 +59,9 @@ func makeACert(names []string) *tls.Certificate {
 }
 
 // tlssniSrvWithNames is kept around for the use of TestValidateTLSALPN01UnawareSrv
-func tlssniSrvWithNames(t *testing.T, chall core.Challenge, names ...string) *httptest.Server {
+func tlssniSrvWithNames(t *testing.T, names ...string) *httptest.Server {
+	t.Helper()
+
 	cert := makeACert(names)
 	tlsConfig := &tls.Config{
 		Certificates: []tls.Certificate{*cert},
@@ -76,13 +78,9 @@ func tlssniSrvWithNames(t *testing.T, chall core.Challenge, names ...string) *ht
 	return hs
 }
 
-func tlsalpn01SrvWithCert(
-	t *testing.T,
-	chall core.Challenge,
-	oid asn1.ObjectIdentifier,
-	names []string,
-	acmeCert *tls.Certificate,
-	tlsVersion uint16) *httptest.Server {
+func tlsalpn01SrvWithCert(t *testing.T, acmeCert *tls.Certificate, tlsVersion uint16) *httptest.Server {
+	t.Helper()
+
 	tlsConfig := &tls.Config{
 		Certificates: []tls.Certificate{},
 		ClientAuth:   tls.NoClientCert,
@@ -135,7 +133,7 @@ func tlsalpn01Srv(
 		PrivateKey:  &TheKey,
 	}
 
-	return tlsalpn01SrvWithCert(t, chall, oid, names, acmeCert, tlsVersion), nil
+	return tlsalpn01SrvWithCert(t, acmeCert, tlsVersion), nil
 }
 
 func TestTLSALPN01FailIP(t *testing.T) {
@@ -467,7 +465,7 @@ func TestValidateTLSALPN01BrokenSrv(t *testing.T) {
 
 func TestValidateTLSALPN01UnawareSrv(t *testing.T) {
 	chall := tlsalpnChallenge()
-	hs := tlssniSrvWithNames(t, chall, "expected")
+	hs := tlssniSrvWithNames(t, "expected")
 
 	va, _ := setup(hs, 0, "", nil)
 
@@ -520,7 +518,7 @@ func TestValidateTLSALPN01MalformedExtnValue(t *testing.T) {
 			PrivateKey:  &TheKey,
 		}
 
-		hs := tlsalpn01SrvWithCert(t, chall, IdPeAcmeIdentifier, names, acmeCert, 0)
+		hs := tlsalpn01SrvWithCert(t, acmeCert, 0)
 		va, _ := setup(hs, 0, "", nil)
 
 		_, prob := va.validateTLSALPN01(ctx, dnsi("expected"), chall)
@@ -657,7 +655,7 @@ func TestTLSALPN01NotSelfSigned(t *testing.T) {
 		PrivateKey:  &TheKey,
 	}
 
-	hs := tlsalpn01SrvWithCert(t, chall, IdPeAcmeIdentifier, []string{"expected"}, acmeCert, tls.VersionTLS12)
+	hs := tlsalpn01SrvWithCert(t, acmeCert, tls.VersionTLS12)
 
 	va, _ := setup(hs, 0, "", nil)
 
@@ -704,7 +702,7 @@ func TestTLSALPN01ExtraIdentifiers(t *testing.T) {
 		PrivateKey:  &TheKey,
 	}
 
-	hs := tlsalpn01SrvWithCert(t, chall, IdPeAcmeIdentifier, []string{"expected"}, acmeCert, tls.VersionTLS12)
+	hs := tlsalpn01SrvWithCert(t, acmeCert, tls.VersionTLS12)
 
 	va, _ := setup(hs, 0, "", nil)
 
@@ -764,13 +762,15 @@ func TestTLSALPN01ExtraSANs(t *testing.T) {
 		PrivateKey:  &TheKey,
 	}
 
-	hs := tlsalpn01SrvWithCert(t, chall, IdPeAcmeIdentifier, []string{"expected"}, acmeCert, tls.VersionTLS12)
+	hs := tlsalpn01SrvWithCert(t, acmeCert, tls.VersionTLS12)
 
 	va, _ := setup(hs, 0, "", nil)
 
 	_, prob := va.validateChallenge(ctx, dnsi("expected"), chall)
 	test.AssertError(t, prob, "validation should have failed")
-	test.AssertContains(t, prob.Error(), "Extension OID 2.5.29.17 seen twice")
+	// In go >= 1.19, the TLS client library detects that the certificate has
+	// a duplicate extension and terminates the connection itself.
+	test.AssertContains(t, prob.Error(), "Error getting validation data")
 }
 
 func TestTLSALPN01ExtraAcmeExtensions(t *testing.T) {
@@ -817,13 +817,15 @@ func TestTLSALPN01ExtraAcmeExtensions(t *testing.T) {
 		PrivateKey:  &TheKey,
 	}
 
-	hs := tlsalpn01SrvWithCert(t, chall, IdPeAcmeIdentifier, []string{"expected"}, acmeCert, tls.VersionTLS12)
+	hs := tlsalpn01SrvWithCert(t, acmeCert, tls.VersionTLS12)
 
 	va, _ := setup(hs, 0, "", nil)
 
 	_, prob := va.validateChallenge(ctx, dnsi("expected"), chall)
 	test.AssertError(t, prob, "validation should have failed")
-	test.AssertContains(t, prob.Error(), "Extension OID 1.3.6.1.5.5.7.1.31 seen twice")
+	// In go >= 1.19, the TLS client library detects that the certificate has
+	// a duplicate extension and terminates the connection itself.
+	test.AssertContains(t, prob.Error(), "Error getting validation data")
 }
 
 func TestAcceptableExtensions(t *testing.T) {

@@ -1,10 +1,13 @@
 package main
 
 import (
+	"encoding/hex"
 	"flag"
 	"fmt"
 	"log"
+	"math/big"
 	"os"
+	"strings"
 
 	"github.com/letsencrypt/boulder/test/ocsp/helper"
 )
@@ -23,16 +26,34 @@ stale.
 `)
 		flag.PrintDefaults()
 	}
+	helper.RegisterFlags()
+	serials := flag.Bool("serials", false, "Parameters are hex-encoded serial numbers instead of filenames. Requires --issuer-file and --url.")
 	flag.Parse()
 	var errors bool
 	if len(flag.Args()) == 0 {
 		flag.Usage()
 		os.Exit(0)
 	}
-	for _, f := range flag.Args() {
-		_, err := helper.ReqFile(f, helper.ConfigFromFlags())
+	config, err := helper.ConfigFromFlags()
+	if err != nil {
+		log.Fatal(err)
+	}
+	for _, a := range flag.Args() {
+		var err error
+		var bytes []byte
+		if *serials {
+			bytes, err = hex.DecodeString(strings.Replace(a, ":", "", -1))
+			if err != nil {
+				log.Printf("error for %s: %s\n", a, err)
+			}
+			serialNumber := big.NewInt(0).SetBytes(bytes)
+			_, err = helper.ReqSerial(serialNumber, config)
+
+		} else {
+			_, err = helper.ReqFile(a, config)
+		}
 		if err != nil {
-			log.Printf("error for %s: %s\n", f, err)
+			log.Printf("error for %s: %s\n", a, err)
 			errors = true
 		}
 	}

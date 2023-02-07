@@ -2,13 +2,8 @@
   "va": {
     "userAgent": "boulder",
     "debugAddr": ":8004",
-    "portConfig": {
-      "httpPort": 5002,
-      "httpsPort": 5001,
-      "tlsPort": 5001
-    },
     "dnsTries": 3,
-    "dnsResolver": "boulder",
+    "dnsResolver": "service.consul",
     "issuerDomain": "happy-hacker-ca.invalid",
     "tls": {
       "caCertfile": "test/grpc-creds/minica.pem",
@@ -29,18 +24,20 @@
     },
     "remoteVAs": [
       {
-        "serverAddress": "va1.boulder:9097",
-        "timeout": "15s"
+        "serverAddress": "rva1.service.consul:9097",
+        "timeout": "15s",
+        "hostOverride": "rva1.boulder"
       },
       {
-        "serverAddress": "va1.boulder:9098",
-        "timeout": "15s"
+        "serverAddress": "rva1.service.consul:9098",
+        "timeout": "15s",
+        "hostOverride": "rva1.boulder"
       }
     ],
     "maxRemoteValidationFailures": 1,
     "accountURIPrefixes": [
-      "http://boulder:4000/acme/reg/",
-      "http://boulder:4001/acme/acct/"
+      "http://boulder.service.consul:4000/acme/reg/",
+      "http://boulder.service.consul:4001/acme/acct/"
     ]
   },
 
@@ -50,7 +47,8 @@
   },
   "beeline": {
       "mute": true,
-      "dataset": "Test"
+      "serviceName": "Test",
+      "writeKey": {"passwordFile": "test/secrets/honeycomb_fake_password"}
   },
 
   "common": {

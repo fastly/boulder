@@ -18,23 +18,35 @@
     "grpc": {
       "maxConnectionAge": "30s",
       "address": ":9095",
-      "clientNames": [
-        "admin-revoker.boulder",
-        "ca.boulder",
-        "crl-updater.boulder",
-        "expiration-mailer.boulder",
-        "health-checker.boulder",
-        "orphan-finder.boulder",
-        "ra.boulder",
-        "sa.boulder",
-        "wfe.boulder"
-      ]
+      "services": {
+        "sa.StorageAuthority": {
+          "clientNames": [
+            "admin-revoker.boulder",
+            "ca.boulder",
+            "crl-updater.boulder",
+            "expiration-mailer.boulder",
+            "ocsp-responder.boulder",
+            "orphan-finder.boulder",
+            "ra.boulder",
+            "wfe.boulder"
+          ]
+        },
+        "sa.StorageAuthorityReadOnly": {
+          "clientNames": [
+            "crl-updater.boulder",
+            "ocsp-responder.boulder",
+            "wfe.boulder"
+          ]
+        },
+        "grpc.health.v1.Health": {
+          "clientNames": [
+            "health-checker.boulder"
+          ]
+        }
+      }
     },
     "features": {
-      "FasterNewOrdersRateLimit": true,
-      "StoreRevokerInfo": true,
-      "GetAuthzReadOnly": true,
-      "GetAuthzUseIndex": true
+      "StoreRevokerInfo": true
     }
   },
 
@@ -44,6 +56,7 @@
   },
   "beeline": {
       "mute": true,
-      "dataset": "Test"
+      "serviceName": "Test",
+      "writeKey": {"passwordFile": "test/secrets/honeycomb_fake_password"}
   }
 }

@@ -7,7 +7,6 @@ import (
 	"flag"
 	"fmt"
 	"html/template"
-	"io/ioutil"
 	netmail "net/mail"
 	"os"
 	"strings"
@@ -150,13 +149,18 @@ func (bkr *badKeyRevoker) findUnrevoked(unchecked uncheckedBlockedKey) ([]unrevo
 		initialID = batch[len(batch)-1].ID
 		for _, serial := range batch {
 			var unrevokedCert unrevokedCertificate
+			// NOTE: This has a `LIMIT 1` because the certificateStatus and precertificates
+			// tables do not have a UNIQUE KEY on serial (for partitioning reasons). So it's
+			// possible we could get multiple results for a single serial number, but they
+			// would be duplicates.
 			err = bkr.dbMap.SelectOne(
 				&unrevokedCert,
 				`SELECT cs.id, cs.serial, c.registrationID, c.der, cs.status, cs.isExpired
 				FROM certificateStatus AS cs
 				JOIN precertificates AS c
 				ON cs.serial = c.serial
-				WHERE cs.serial = ?`,
+				WHERE cs.serial = ?
+				LIMIT 1`,
 				serial.CertSerial,
 			)
 			if err != nil {
@@ -451,14 +455,13 @@ func main() {
 	tlsConfig, err := config.BadKeyRevoker.TLS.Load()
 	cmd.FailOnError(err, "TLS config")
 
-	clientMetrics := bgrpc.NewClientMetrics(scope)
-	conn, err := bgrpc.ClientSetup(config.BadKeyRevoker.RAService, tlsConfig, clientMetrics, clk)
+	conn, err := bgrpc.ClientSetup(config.BadKeyRevoker.RAService, tlsConfig, scope, clk)
 	cmd.FailOnError(err, "Failed to load credentials and create gRPC connection to RA")
 	rac := rapb.NewRegistrationAuthorityClient(conn)
 
 	var smtpRoots *x509.CertPool
 	if config.BadKeyRevoker.Mailer.SMTPTrustedRootFile != "" {
-		pem, err := ioutil.ReadFile(config.BadKeyRevoker.Mailer.SMTPTrustedRootFile)
+		pem, err := os.ReadFile(config.BadKeyRevoker.Mailer.SMTPTrustedRootFile)
 		cmd.FailOnError(err, "Loading trusted roots file")
 		smtpRoots = x509.NewCertPool()
 		if !smtpRoots.AppendCertsFromPEM(pem) {
@@ -487,7 +490,7 @@ func main() {
 	if config.BadKeyRevoker.Mailer.EmailSubject == "" {
 		cmd.Fail("BadKeyRevoker.Mailer.EmailSubject must be populated")
 	}
-	templateBytes, err := ioutil.ReadFile(config.BadKeyRevoker.Mailer.EmailTemplate)
+	templateBytes, err := os.ReadFile(config.BadKeyRevoker.Mailer.EmailTemplate)
 	cmd.FailOnError(err, fmt.Sprintf("failed to read email template %q: %s", config.BadKeyRevoker.Mailer.EmailTemplate, err))
 	emailTemplate, err := template.New("email").Parse(string(templateBytes))
 	cmd.FailOnError(err, fmt.Sprintf("failed to parse email template %q: %s", config.BadKeyRevoker.Mailer.EmailTemplate, err))

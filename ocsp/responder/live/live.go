@@ -2,13 +2,15 @@ package live
 
 import (
 	"context"
+	"errors"
 
 	capb "github.com/letsencrypt/boulder/ca/proto"
 	"github.com/letsencrypt/boulder/core"
+	berrors "github.com/letsencrypt/boulder/errors"
 	"github.com/letsencrypt/boulder/ocsp/responder"
 	rapb "github.com/letsencrypt/boulder/ra/proto"
+	"github.com/letsencrypt/boulder/semaphore"
 	"golang.org/x/crypto/ocsp"
-	"golang.org/x/sync/semaphore"
 	"google.golang.org/grpc"
 )
 
@@ -21,10 +23,10 @@ type Source struct {
 	sem *semaphore.Weighted
 }
 
-func New(ra ocspGenerator, maxInflight int64) *Source {
+func New(ra ocspGenerator, maxInflight int64, maxWaiters int) *Source {
 	return &Source{
 		ra:  ra,
-		sem: semaphore.NewWeighted(maxInflight),
+		sem: semaphore.NewWeighted(maxInflight, maxWaiters),
 	}
 }
 
@@ -42,6 +44,9 @@ func (s *Source) Response(ctx context.Context, req *ocsp.Request) (*responder.Re
 		Serial: core.SerialToString(req.SerialNumber),
 	})
 	if err != nil {
+		if errors.Is(err, berrors.NotFound) {
+			return nil, responder.ErrNotFound
+		}
 		return nil, err
 	}
 	parsed, err := ocsp.ParseResponse(resp.Response, nil)

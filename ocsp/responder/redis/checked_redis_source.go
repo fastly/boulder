@@ -3,17 +3,19 @@ package redis
 import (
 	"context"
 	"errors"
+	"reflect"
 	"sync"
 
 	"github.com/go-gorp/gorp/v3"
+	"github.com/prometheus/client_golang/prometheus"
+	"golang.org/x/crypto/ocsp"
+
 	"github.com/letsencrypt/boulder/core"
 	"github.com/letsencrypt/boulder/db"
 	blog "github.com/letsencrypt/boulder/log"
 	"github.com/letsencrypt/boulder/ocsp/responder"
-	"github.com/letsencrypt/boulder/revocation"
 	"github.com/letsencrypt/boulder/sa"
-	"github.com/prometheus/client_golang/prometheus"
-	"golang.org/x/crypto/ocsp"
+	sapb "github.com/letsencrypt/boulder/sa/proto"
 )
 
 // dbSelector is a limited subset of the db.WrappedMap interface to allow for
@@ -27,29 +29,47 @@ type dbSelector interface {
 // This allows checkedRedisSource to trigger a live signing if the DB disagrees with Redis.
 type rocspSourceInterface interface {
 	Response(ctx context.Context, req *ocsp.Request) (*responder.Response, error)
-	signAndSave(ctx context.Context, req *ocsp.Request, cause string) (*responder.Response, error)
+	signAndSave(ctx context.Context, req *ocsp.Request, cause signAndSaveCause) (*responder.Response, error)
 }
 
+// checkedRedisSource implements the Source interface. It relies on two
+// underlying datastores to provide its OCSP responses: a rocspSourceInterface
+// (a Source that can also signAndSave new responses) to provide the responses
+// themselves, and the database to double-check that those responses match the
+// authoritative revocation status stored in the db.
+// TODO(#6285): Inline the rocspSourceInterface into this type.
+// TODO(#6295): Remove the dbMap after all deployments use the SA instead.
 type checkedRedisSource struct {
 	base    rocspSourceInterface
 	dbMap   dbSelector
+	sac     sapb.StorageAuthorityReadOnlyClient
 	counter *prometheus.CounterVec
 	log     blog.Logger
 }
 
 // NewCheckedRedisSource builds a source that queries both the DB and Redis, and confirms
 // the value in Redis matches the DB.
-func NewCheckedRedisSource(base *redisSource, dbMap dbSelector, stats prometheus.Registerer, log blog.Logger) (*checkedRedisSource, error) {
+func NewCheckedRedisSource(base *redisSource, dbMap dbSelector, sac sapb.StorageAuthorityReadOnlyClient, stats prometheus.Registerer, log blog.Logger) (*checkedRedisSource, error) {
 	if base == nil {
 		return nil, errors.New("base was nil")
 	}
 
-	return newCheckedRedisSource(base, dbMap, stats, log), nil
+	// We have to use reflect here because these arguments are interfaces, and
+	// thus checking for nil the normal way doesn't work reliably, because they
+	// may be non-nil interfaces whose inner value is still nil, i.e. "boxed nil".
+	// But using reflect here is okay, because we only expect this constructor to
+	// be called once per process.
+	if (reflect.TypeOf(sac) == nil || reflect.ValueOf(sac).IsNil()) &&
+		(reflect.TypeOf(dbMap) == nil || reflect.ValueOf(dbMap).IsNil()) {
+		return nil, errors.New("either SA gRPC or direct DB connection must be provided")
+	}
+
+	return newCheckedRedisSource(base, dbMap, sac, stats, log), nil
 }
 
 // newCheckRedisSource is an internal-only constructor that takes a private interface as a parameter.
 // We call this from tests and from NewCheckedRedisSource.
-func newCheckedRedisSource(base rocspSourceInterface, dbMap dbSelector, stats prometheus.Registerer, log blog.Logger) *checkedRedisSource {
+func newCheckedRedisSource(base rocspSourceInterface, dbMap dbSelector, sac sapb.StorageAuthorityReadOnlyClient, stats prometheus.Registerer, log blog.Logger) *checkedRedisSource {
 	counter := prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "checked_rocsp_responses",
 		Help: "Count of OCSP requests/responses from checkedRedisSource, by result",
@@ -59,14 +79,10 @@ func newCheckedRedisSource(base rocspSourceInterface, dbMap dbSelector, stats pr
 	return &checkedRedisSource{
 		base:    base,
 		dbMap:   dbMap,
+		sac:     sac,
 		counter: counter,
 		log:     log,
 	}
-}
-
-var ocspCodeToStatus = map[int]core.OCSPStatus{
-	ocsp.Good:    core.OCSPStatusGood,
-	ocsp.Revoked: core.OCSPStatusRevoked,
 }
 
 // Response implements the responder.Source interface. It looks up the requested OCSP
@@ -77,13 +93,16 @@ func (src *checkedRedisSource) Response(ctx context.Context, req *ocsp.Request) 
 
 	var wg sync.WaitGroup
 	wg.Add(2)
-	var dbStatus core.CertificateStatus
+	var dbStatus *sapb.RevocationStatus
 	var redisResult *responder.Response
 	var redisErr, dbErr error
 	go func() {
 		defer wg.Done()
-		// TODO(#6274): Make a more efficient query here that looks only at status and revokedAt.
-		dbStatus, dbErr = sa.SelectCertificateStatus(src.dbMap.WithContext(ctx), serialString)
+		if src.sac != nil {
+			dbStatus, dbErr = src.sac.GetRevocationStatus(ctx, &sapb.Serial{Serial: serialString})
+		} else {
+			dbStatus, dbErr = sa.SelectRevocationStatus(src.dbMap.WithContext(ctx), serialString)
+		}
 	}()
 	go func() {
 		defer wg.Done()
@@ -115,27 +134,27 @@ func (src *checkedRedisSource) Response(ctx context.Context, req *ocsp.Request) 
 	}
 
 	// Otherwise, the DB is authoritative. Trigger a fresh signing.
-	freshResult, err := src.base.signAndSave(ctx, req, serialString)
+	freshResult, err := src.base.signAndSave(ctx, req, causeMismatch)
 	if err != nil {
-		src.counter.WithLabelValues("sign_and_save_error").Inc()
+		src.counter.WithLabelValues("revocation_re_sign_error").Inc()
 		return nil, err
 	}
 
 	if agree(dbStatus, freshResult.Response) {
-		src.counter.WithLabelValues("sign_and_save_success").Inc()
+		src.counter.WithLabelValues("revocation_re_sign_success").Inc()
 		return freshResult, nil
 	}
 
 	// This could happen for instance with replication lag, or if the
 	// RA was talking to a different DB.
-	src.counter.WithLabelValues("sign_and_save_mismatch").Inc()
+	src.counter.WithLabelValues("revocation_re_sign_mismatch").Inc()
 	return nil, errors.New("freshly signed status did not match DB")
 
 }
 
 // agree returns true if the contents of the redisResult ocsp.Response agree with what's in the DB.
-func agree(dbStatus core.CertificateStatus, redisResult *ocsp.Response) bool {
-	return dbStatus.Status == ocspCodeToStatus[redisResult.Status] &&
-		dbStatus.RevokedReason == revocation.Reason(redisResult.RevocationReason) &&
-		dbStatus.RevokedDate.Equal(redisResult.RevokedAt)
+func agree(dbStatus *sapb.RevocationStatus, redisResult *ocsp.Response) bool {
+	return dbStatus.Status == int64(redisResult.Status) &&
+		dbStatus.RevokedReason == int64(redisResult.RevocationReason) &&
+		dbStatus.RevokedDate.AsTime().Equal(redisResult.RevokedAt)
 }

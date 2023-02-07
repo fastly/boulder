@@ -8,6 +8,10 @@
       "dbConnectFile": "test/secrets/sa_ro_dburl",
       "maxOpenConns": 100
     },
+    "incidentsDB": {
+      "dbConnectFile": "test/secrets/incidents_dburl",
+      "maxOpenConns": 100
+    },
     "ParallelismPerRPC": 20,
     "debugAddr": ":8003",
     "tls": {
@@ -18,24 +22,37 @@
     "grpc": {
       "maxConnectionAge": "30s",
       "address": ":9095",
-      "clientNames": [
-        "admin-revoker.boulder",
-        "ca.boulder",
-        "crl-updater.boulder",
-        "expiration-mailer.boulder",
-        "health-checker.boulder",
-        "orphan-finder.boulder",
-        "ra.boulder",
-        "sa.boulder",
-        "wfe.boulder"
-      ]
+      "services": {
+        "sa.StorageAuthority": {
+          "clientNames": [
+            "admin-revoker.boulder",
+            "ca.boulder",
+            "expiration-mailer.boulder",
+            "orphan-finder.boulder",
+            "ra.boulder"
+          ]
+        },
+        "sa.StorageAuthorityReadOnly": {
+          "clientNames": [
+            "crl-updater.boulder",
+            "ocsp-responder.boulder",
+            "wfe.boulder"
+          ]
+        },
+        "grpc.health.v1.Health": {
+          "clientNames": [
+            "health-checker.boulder"
+          ]
+        }
+      }
     },
     "redis": {
       "username": "boulder-sa",
       "passwordFile": "test/secrets/sa_redis_password",
-      "addrs": [
-        "10.33.33.7:4218"
-      ],
+      "shardAddrs": {
+        "shard1": "10.33.33.8:4218",
+        "shard2": "10.33.33.9:4218"
+      },
       "timeout": "5s",
       "tls": {
         "caCertFile": "test/redis-tls/minica.pem",
@@ -50,19 +67,18 @@
       ".hierarchy/intermediate-cert-rsa-b.pem": 4
     },
     "features": {
-      "FasterNewOrdersRateLimit": true,
       "StoreRevokerInfo": true,
-      "GetAuthzReadOnly": true,
-      "GetAuthzUseIndex": true
+      "ROCSPStage6": true
     }
   },
 
   "syslog": {
     "stdoutlevel": 6,
-    "sysloglevel": 6
+    "sysloglevel": -1
   },
   "beeline": {
       "mute": true,
-      "dataset": "Test"
+      "serviceName": "Test",
+      "writeKey": {"passwordFile": "test/secrets/honeycomb_fake_password"}
   }
 }

@@ -2,69 +2,59 @@ package reloader
 
 import (
 	"fmt"
-	"io/ioutil"
+	"io/fs"
 	"os"
 	"reflect"
 	"testing"
 	"time"
+
+	blog "github.com/letsencrypt/boulder/log"
 )
 
 func noop([]byte) error {
 	return nil
 }
 
-func testErrCb(t *testing.T) func(error) {
-	return func(e error) {
-		t.Error(e)
-	}
-}
-
-func testFatalCb(t *testing.T) func(error) {
-	return func(e error) {
-		t.Fatal(e)
-	}
-}
-
 func TestNoStat(t *testing.T) {
 	filename := os.TempDir() + "/doesntexist.123456789"
-	_, err := New(filename, noop, testErrCb(t))
+	_, err := New(filename, noop, blog.NewMock())
 	if err == nil {
 		t.Fatalf("Expected New to return error when the file doesn't exist.")
 	}
 }
 
 func TestNoRead(t *testing.T) {
-	f, _ := ioutil.TempFile("", "test-no-read.txt")
+	f, _ := os.CreateTemp("", "test-no-read.txt")
 	defer os.Remove(f.Name())
 	oldReadFile := readFile
 	readFile = func(string) ([]byte, error) {
 		return nil, fmt.Errorf("read failed")
 	}
-	_, err := New(f.Name(), noop, testErrCb(t))
+	_, err := New(f.Name(), noop, blog.NewMock())
 	if err == nil {
-		t.Fatalf("Expected New to return error when permission denied.")
 		readFile = oldReadFile
+		t.Fatalf("Expected New to return error when permission denied.")
 	}
 	readFile = oldReadFile
 }
 
 func TestFirstError(t *testing.T) {
-	f, _ := ioutil.TempFile("", "test-first-error.txt")
+	f, _ := os.CreateTemp("", "test-first-error.txt")
 	defer os.Remove(f.Name())
 	_, err := New(f.Name(), func([]byte) error {
 		return fmt.Errorf("i die")
-	}, testErrCb(t))
+	}, blog.NewMock())
 	if err == nil {
 		t.Fatalf("Expected New to return error when the callback returned error the first time.")
 	}
 }
 
 func TestFirstSuccess(t *testing.T) {
-	f, _ := ioutil.TempFile("", "test-first-success.txt")
+	f, _ := os.CreateTemp("", "test-first-success.txt")
 	defer os.Remove(f.Name())
 	r, err := New(f.Name(), func([]byte) error {
 		return nil
-	}, testErrCb(t))
+	}, blog.NewMock())
 	if err != nil {
 		t.Errorf("Expected New to succeed, got %s", err)
 	}
@@ -90,7 +80,7 @@ func TestReload(t *testing.T) {
 	fakeTick, restoreMakeTicker := makeFakeMakeTicker()
 	defer restoreMakeTicker()
 
-	f, _ := ioutil.TempFile("", "test-reload.txt")
+	f, _ := os.CreateTemp("", "test-reload.txt")
 	filename := f.Name()
 	defer os.Remove(filename)
 
@@ -103,7 +93,7 @@ func TestReload(t *testing.T) {
 		bodies = append(bodies, string(b))
 		reloads <- b
 		return nil
-	}, testFatalCb(t))
+	}, blog.NewMock())
 	if err != nil {
 		t.Fatalf("Expected New to succeed, got %s", err)
 	}
@@ -121,7 +111,7 @@ func TestReload(t *testing.T) {
 	// Write to the file, expect a reload. Sleep a few milliseconds first so the
 	// timestamps actually differ.
 	time.Sleep(1 * time.Second)
-	err = ioutil.WriteFile(filename, []byte("second body"), 0644)
+	err = os.WriteFile(filename, []byte("second body"), 0644)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -141,11 +131,22 @@ func TestReload(t *testing.T) {
 	}
 }
 
+// existingFile implements fs.FileInfo / os.FileInfo and returns information
+// as if it were a basic file that existed. This is used to mock out os.Stat.
+type existingFile struct{}
+
+func (e existingFile) Name() string       { return "example" }
+func (e existingFile) Size() int64        { return 10 }
+func (e existingFile) Mode() fs.FileMode  { return 0 }
+func (e existingFile) ModTime() time.Time { return time.Now() }
+func (e existingFile) IsDir() bool        { return false }
+func (e existingFile) Sys() any           { return nil }
+
 func TestReloadFailure(t *testing.T) {
 	// Mock out makeTicker
 	fakeTick, restoreMakeTicker := makeFakeMakeTicker()
 
-	f, _ := ioutil.TempFile("", "test-reload-failure.txt")
+	f, _ := os.CreateTemp("", "test-reload-failure.txt")
 	filename := f.Name()
 	defer func() {
 		restoreMakeTicker()
@@ -161,46 +162,45 @@ func TestReloadFailure(t *testing.T) {
 	}
 
 	reloads := make(chan res, 1)
+	log := blog.NewMock()
 	_, err := New(filename, func(b []byte) error {
 		reloads <- res{b, nil}
 		return nil
-	}, func(e error) {
-		reloads <- res{nil, e}
-	})
+	}, log)
 	if err != nil {
 		t.Fatalf("Expected New to succeed.")
 	}
 	<-reloads
 	os.Remove(filename)
 	fakeTick <- time.Now()
-	select {
-	case r := <-reloads:
-		if r.err == nil {
-			t.Errorf("Expected error trying to read missing file.")
-		}
-	case <-time.After(5 * time.Second):
-		t.Errorf("timed out waiting for reload")
+	time.Sleep(50 * time.Millisecond)
+	err = log.ExpectMatch("statting .* no such file or directory")
+	if err != nil {
+		t.Error(err)
 	}
 
-	time.Sleep(1 * time.Second)
-	// Create a file with no permissions
+	log.Clear()
+
+	// Mock a file with no permissions
 	oldReadFile := readFile
 	readFile = func(string) ([]byte, error) {
 		return nil, fmt.Errorf("permission denied")
 	}
+	oldStatFile := statFile
+	statFile = func(string) (fs.FileInfo, error) {
+		return existingFile{}, nil
+	}
 
 	fakeTick <- time.Now()
-	select {
-	case r := <-reloads:
-		if r.err == nil {
-			t.Errorf("Expected error trying to read file with no permissions.")
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatalf("timed out waiting for reload")
+	time.Sleep(50 * time.Millisecond)
+	err = log.ExpectMatch("reading .* permission denied")
+	if err != nil {
+		t.Error(err)
 	}
 	readFile = oldReadFile
+	statFile = oldStatFile
 
-	err = ioutil.WriteFile(filename, []byte("third body"), 0644)
+	err = os.WriteFile(filename, []byte("third body"), 0644)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -208,7 +208,7 @@ func TestReloadFailure(t *testing.T) {
 	select {
 	case r := <-reloads:
 		if r.err != nil {
-			t.Errorf("Unexpected error: %s", err)
+			t.Errorf("Unexpected error: %s", r.err)
 		}
 		if string(r.b) != "third body" {
 			t.Errorf("Expected 'third body' reading file after restoring it.")

@@ -4,12 +4,8 @@ import (
 	"flag"
 	"os"
 
-	"google.golang.org/grpc/health"
-	healthpb "google.golang.org/grpc/health/grpc_health_v1"
-
 	"github.com/honeycombio/beeline-go"
 	"github.com/letsencrypt/boulder/cmd"
-	"github.com/letsencrypt/boulder/db"
 	"github.com/letsencrypt/boulder/features"
 	bgrpc "github.com/letsencrypt/boulder/grpc"
 	rocsp_config "github.com/letsencrypt/boulder/rocsp/config"
@@ -20,10 +16,12 @@ import (
 type Config struct {
 	SA struct {
 		cmd.ServiceConfig
-		DB         cmd.DBConfig
-		ReadOnlyDB cmd.DBConfig
-		Redis      *rocsp_config.RedisConfig
-		Issuers    map[string]int
+		DB          cmd.DBConfig
+		ReadOnlyDB  cmd.DBConfig
+		IncidentsDB cmd.DBConfig
+		Redis       *rocsp_config.RedisConfig
+		// TODO(#6285): Remove this field, as it is no longer used.
+		Issuers map[string]int
 
 		Features map[string]bool
 
@@ -71,45 +69,42 @@ func main() {
 	dbMap, err := sa.InitWrappedDb(c.SA.DB, scope, logger)
 	cmd.FailOnError(err, "While initializing dbMap")
 
-	dbReadOnlyURL, err := c.SA.ReadOnlyDB.URL()
-	cmd.FailOnError(err, "Couldn't load read-only DB URL")
-
-	var dbReadOnlyMap *db.WrappedMap
-	if dbReadOnlyURL == "" {
-		dbReadOnlyMap = dbMap
-	} else {
+	dbReadOnlyMap := dbMap
+	if c.SA.ReadOnlyDB != (cmd.DBConfig{}) {
 		dbReadOnlyMap, err = sa.InitWrappedDb(c.SA.ReadOnlyDB, scope, logger)
-		cmd.FailOnError(err, "While initializing dbMap")
+		cmd.FailOnError(err, "While initializing dbReadOnlyMap")
+	}
+
+	dbIncidentsMap := dbMap
+	if c.SA.IncidentsDB != (cmd.DBConfig{}) {
+		dbIncidentsMap, err = sa.InitWrappedDb(c.SA.IncidentsDB, scope, logger)
+		cmd.FailOnError(err, "While initializing dbIncidentsMap")
 	}
 
 	clk := cmd.Clock()
-
-	shortIssuers, err := rocsp_config.LoadIssuers(c.SA.Issuers)
-	cmd.FailOnError(err, "loading issuers")
 
 	parallel := c.SA.ParallelismPerRPC
 	if parallel < 1 {
 		parallel = 1
 	}
-	sai, err := sa.NewSQLStorageAuthority(dbMap, dbReadOnlyMap, shortIssuers, clk, logger, scope, parallel)
-	cmd.FailOnError(err, "Failed to create SA impl")
 
 	tls, err := c.SA.TLS.Load()
 	cmd.FailOnError(err, "TLS config")
-	serverMetrics := bgrpc.NewServerMetrics(scope)
-	grpcSrv, listener, err := bgrpc.NewServer(c.SA.GRPC, tls, serverMetrics, clk, bgrpc.NoCancelInterceptor)
+
+	saroi, err := sa.NewSQLStorageAuthorityRO(dbReadOnlyMap, dbIncidentsMap, parallel, clk, logger)
+	cmd.FailOnError(err, "Failed to create read-only SA impl")
+
+	sai, err := sa.NewSQLStorageAuthorityWrapping(saroi, dbMap, scope)
+	cmd.FailOnError(err, "Failed to create SA impl")
+
+	start, stop, err := bgrpc.NewServer(c.SA.GRPC).Add(
+		&sapb.StorageAuthorityReadOnly_ServiceDesc, saroi).Add(
+		&sapb.StorageAuthority_ServiceDesc, sai).Build(
+		tls, scope, clk)
 	cmd.FailOnError(err, "Unable to setup SA gRPC server")
-	sapb.RegisterStorageAuthorityServer(grpcSrv, sai)
-	hs := health.NewServer()
-	healthpb.RegisterHealthServer(grpcSrv, hs)
 
-	go cmd.CatchSignals(logger, func() {
-		hs.Shutdown()
-		grpcSrv.GracefulStop()
-	})
-
-	err = cmd.FilterShutdownErrors(grpcSrv.Serve(listener))
-	cmd.FailOnError(err, "SA gRPC service failed")
+	go cmd.CatchSignals(logger, stop)
+	cmd.FailOnError(start(), "SA gRPC service failed")
 }
 
 func init() {

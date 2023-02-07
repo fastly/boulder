@@ -10,7 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"net/url"
 	"strings"
@@ -127,7 +127,7 @@ func NewCachePurgeClient(
 // is used to identify clients to Akamai's EdgeGrid APIs. For a more detailed
 // description of the generation process see their docs:
 // https://developer.akamai.com/introduction/Client_Auth.html
-func (cpc *CachePurgeClient) makeAuthHeader(body []byte, apiPath string, nonce string) (string, error) {
+func (cpc *CachePurgeClient) makeAuthHeader(body []byte, apiPath string, nonce string) string {
 	// The akamai API is very time sensitive (recommending reliance on a stratum 2
 	// or better time source). Additionally, timestamps MUST be in UTC.
 	timestamp := cpc.clk.Now().UTC().Format(timestampFormat)
@@ -158,7 +158,7 @@ func (cpc *CachePurgeClient) makeAuthHeader(body []byte, apiPath string, nonce s
 		"%ssignature=%s",
 		header,
 		base64.StdEncoding.EncodeToString(h.Sum(nil)),
-	), nil
+	)
 }
 
 // signingKey makes a signing key by HMAC'ing the timestamp
@@ -207,10 +207,7 @@ func (cpc *CachePurgeClient) authedRequest(endpoint string, body v3PurgeRequest)
 		return fmt.Errorf("while parsing %q as URL: %s: %w", endpoint, err, errFatal)
 	}
 
-	authorization, err := cpc.makeAuthHeader(reqBody, endpointURL.Path, core.RandomString(16))
-	if err != nil {
-		return fmt.Errorf("%s: %w", err, errFatal)
-	}
+	authorization := cpc.makeAuthHeader(reqBody, endpointURL.Path, core.RandomString(16))
 	req.Header.Set("Authorization", authorization)
 	req.Header.Set("Content-Type", "application/json")
 	cpc.log.Debugf("POSTing to endpoint %q (header %q) (body %q)", endpoint, authorization, reqBody)
@@ -227,7 +224,7 @@ func (cpc *CachePurgeClient) authedRequest(endpoint string, body v3PurgeRequest)
 		return fmt.Errorf("response body was empty from URL %q", resp.Request.URL)
 	}
 
-	respBody, err := ioutil.ReadAll(resp.Body)
+	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return err
 	}
